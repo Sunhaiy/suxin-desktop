@@ -1,0 +1,110 @@
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/roboto-mono';
+@import '@fontsource-variable/material-symbols-rounded';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Hoppscotch Desktop 设计 token ──────────────────────────── */
+:root {
+  --font-sans: 'Inter Variable', sans-serif;
+  --font-mono: 'Roboto Mono Variable', monospace;
+  --font-size-body: 0.75rem;
+  --font-size-tiny: 0.625rem;
+  --line-height-body: 1rem;
+
+  /* 暗色主题（默认） */
+  --primary-color: #181818;
+  --primary-light-color: #1c1c1e;
+  --primary-dark-color: #262626;
+  --primary-contrast-color: #171717;
+
+  --secondary-color: #a3a3a3;
+  --secondary-light-color: #737373;
+  --secondary-dark-color: #fafafa;
+
+  --divider-color: #262626;
+  --divider-light-color: #1f1f1f;
+  --divider-dark-color: #2d2d2d;
+
+  --accent-color: #10b981;
+  --accent-light-color: #34d399;
+  --accent-dark-color: #059669;
+  --accent-contrast-color: #fff;
+
+  --tooltip-color: #f5f5f5;
+  --popover-color: #1b1b1b;
+}
+
+/* ── 全局重置 ───────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-primary text-secondary font-sans font-medium select-none overflow-hidden;
+  font-size: var(--font-size-body);
+  line-height: var(--line-height-body);
+  -webkit-font-smoothing: antialiased;
+  animation: fade 200ms forwards;
+}
+
+@keyframes fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ── 滚动条 ─────────────────────────────────────────────────── */
+::-webkit-scrollbar { @apply w-3 h-0; }
+::-webkit-scrollbar-track { @apply bg-transparent; }
+::-webkit-scrollbar-thumb {
+  @apply bg-divider bg-clip-content rounded-full border-4 border-solid border-transparent;
+}
+::-webkit-scrollbar-thumb:hover { @apply bg-dividerDark; }
+
+/* ── 动画工具类 ─────────────────────────────────────────────── */
+.fade-enter { animation: fade 150ms ease forwards; }
+
+.slide-enter  { animation: slideIn  200ms ease forwards; }
+.bounce-enter { animation: bounceIn 150ms ease forwards; }
+
+@keyframes slideIn  { from { transform: translateX(-8px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes bounceIn { from { transform: scale(0.96);       opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* ── 拖拽区域（无边框窗口） ──────────────────────────────────── */
+.drag-region  { -webkit-app-region: drag; }
+.no-drag      { -webkit-app-region: no-drag; }
+
+/* ── 滚动条工具类 ────────────────────────────────────────────── */
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+/* ── 图标字体（Material Symbols）──────────────────────────────── */
+.ms-icon {
+  font-family: 'Material Symbols Rounded Variable', sans-serif;
+  font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 20;
+  font-size: 1rem;
+  line-height: 1;
+  user-select: none;
+}
+
+/* ── 通用交互状态 ──────────────────────────────────────────── */
+button, [role="button"] {
+  @apply transition-colors duration-150 cursor-pointer focus:outline-none;
+}
+
+input, textarea {
+  @apply text-secondaryDark font-medium;
+}
+
+input::placeholder, textarea::placeholder {
+  @apply text-secondary opacity-50;
+}
