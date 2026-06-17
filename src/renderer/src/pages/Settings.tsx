@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { LogIn, LogOut, Loader2 } from 'lucide-react'
+import { LogIn, LogOut, Loader2, FolderOpen, Copy, Check } from 'lucide-react'
 import { getAuthStatus, loginNetease, logoutNetease, loginQQ, logoutQQ } from '../api/music'
 import { useToastStore } from '../store/toast'
 
@@ -64,21 +64,30 @@ function PlatformRow({
 }
 
 export default function Settings() {
-  const [autoLaunch, setAutoLaunch] = useState(false)
-  const [version, setVersion]       = useState('')
-  const [auth, setAuth]             = useState({ netease: false, qq: false })
-  const [loading, setLoading]       = useState({ netease: false, qq: false })
+  const [autoLaunch,    setAutoLaunch]    = useState(false)
+  const [version,       setVersion]       = useState('')
+  const [auth,          setAuth]          = useState({ netease: false, qq: false })
+  const [loading,       setLoading]       = useState({ netease: false, qq: false })
+  const [navPort,       setNavPort]       = useState(9900)
+  const [navPortInput,  setNavPortInput]  = useState('9900')
+  const [navUrl,        setNavUrl]        = useState('http://localhost:9900')
+  const [navPortBusy,   setNavPortBusy]   = useState(false)
+  const [copied,        setCopied]        = useState(false)
   const toast = useToastStore()
 
   async function refresh() {
-    const [status, al, ver] = await Promise.all([
+    const [status, al, ver, port, url] = await Promise.all([
       getAuthStatus(),
       window.electron?.app.getAutoLaunch(),
       window.electron?.app.version(),
+      window.electron.invoke<number>('nav:getPort'),
+      window.electron.invoke<string>('nav:getUrl'),
     ])
     setAuth(status)
     setAutoLaunch(al ?? false)
     setVersion(ver ?? '')
+    if (port)  { setNavPort(port);  setNavPortInput(String(port)) }
+    if (url)   setNavUrl(url)
   }
 
   useEffect(() => { refresh() }, [])
@@ -101,6 +110,31 @@ export default function Settings() {
     }
   }
 
+  async function handleApplyPort() {
+    const p = parseInt(navPortInput, 10)
+    if (isNaN(p) || p < 1024 || p > 65535) {
+      toast.show('端口需在 1024 – 65535 之间', 'error'); return
+    }
+    if (p === navPort) return
+    setNavPortBusy(true)
+    try {
+      const newUrl = await window.electron.invoke<string>('nav:setPort', p)
+      setNavPort(p)
+      setNavUrl(newUrl)
+      toast.show(`导航页已切换至 ${newUrl}`, 'success')
+    } catch {
+      toast.show('端口切换失败，可能已被占用', 'error')
+      setNavPortInput(String(navPort))
+    }
+    setNavPortBusy(false)
+  }
+
+  function copyNavUrl() {
+    navigator.clipboard.writeText(navUrl)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
   async function handleLogout(platform: 'netease' | 'qq') {
     const fn = platform === 'netease' ? logoutNetease : logoutQQ
     await fn()
@@ -120,6 +154,59 @@ export default function Settings() {
           <p className="mb-2 text-tiny font-semibold uppercase tracking-wider text-secondaryLight">通用</p>
           <SettingRow label="开机自启" description="系统启动时自动在后台运行">
             <Toggle value={autoLaunch} onChange={handleAutoLaunch} />
+          </SettingRow>
+        </section>
+
+        {/* 导航页 */}
+        <section className="px-4 pt-4">
+          <p className="mb-1 text-tiny font-semibold uppercase tracking-wider text-secondaryLight">导航页</p>
+          <p className="mb-3 text-tiny text-secondary opacity-60">
+            本地 HTTP 服务，可将浏览器主页设置为此地址。修改 userData/nav/index.html 自定义内容。
+          </p>
+
+          <SettingRow label="端口">
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                value={navPortInput}
+                min={1024}
+                max={65535}
+                onChange={e => setNavPortInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleApplyPort()}
+                className="w-20 rounded border border-dividerLight bg-primaryDark px-2 py-1 text-center font-mono text-tiny text-secondaryDark outline-none focus:border-accent [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+              />
+              <button
+                onClick={handleApplyPort}
+                disabled={navPortBusy || navPortInput === String(navPort)}
+                className="rounded px-2.5 py-1 text-tiny text-accent transition-colors hover:bg-primaryDark disabled:opacity-40"
+              >
+                {navPortBusy ? '切换中…' : '应用'}
+              </button>
+            </div>
+          </SettingRow>
+
+          <SettingRow label="访问地址">
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-tiny text-secondary">{navUrl}</span>
+              <button
+                onClick={copyNavUrl}
+                title="复制地址"
+                className="flex items-center gap-1 rounded px-2 py-1 text-tiny transition-colors hover:bg-primaryDark"
+              >
+                {copied
+                  ? <><Check size={12} className="text-accent" /><span className="text-accent">已复制</span></>
+                  : <><Copy size={12} className="text-secondary" /><span className="text-secondary">复制</span></>}
+              </button>
+            </div>
+          </SettingRow>
+
+          <SettingRow label="文件目录" description="打开存放页面文件的文件夹">
+            <button
+              onClick={() => window.electron.invoke('nav:openDir')}
+              className="flex items-center gap-1.5 rounded px-2.5 py-1 text-tiny text-secondary transition-colors hover:bg-primaryDark hover:text-secondaryDark"
+            >
+              <FolderOpen size={12} /> 打开
+            </button>
           </SettingRow>
         </section>
 

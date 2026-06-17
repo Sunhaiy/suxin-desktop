@@ -23,6 +23,12 @@ const api = {
   },
   invoke: <T = unknown>(channel: string, payload?: unknown): Promise<T> =>
     ipcRenderer.invoke(channel, payload) as Promise<T>,
+  /** 监听主进程推送的事件，返回取消监听函数 */
+  on: (channel: string, cb: (...args: unknown[]) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, ...args: unknown[]) => cb(...args)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.off(channel, listener)
+  },
 }
 
 contextBridge.exposeInMainWorld('electron', api)

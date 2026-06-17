@@ -72,6 +72,56 @@ function mapSong(s: any, rawCover: string) {
   }
 }
 
+// ── 排行榜（热歌/新歌/飙升） ────────────────────────────────────────
+const CHART_IDS = [
+  { id: 3778678,  name: '热歌榜' },
+  { id: 3779629,  name: '新歌榜' },
+  { id: 19723756, name: '飙升榜' },
+]
+
+export interface ChartCard {
+  id: number
+  name: string
+  cover: string
+  tracks: ReturnType<typeof mapSong>[]
+}
+
+export async function getCharts(): Promise<ChartCard[]> {
+  const results = await Promise.allSettled(
+    CHART_IDS.map(async ({ id, name }) => {
+      const res = await http('/api/playlist/detail', {
+        id, t: -1, n: 10, s: 0, csrf_token: '',
+      })
+      const pl = res.playlist ?? {}
+      const tracks = ((pl.tracks ?? []) as any[])
+        .slice(0, 5)
+        .map((s: any) => mapSong(s, s.al?.picUrl ?? ''))
+      const rawCover = pl.coverImgUrl || pl.picUrl || pl.backgroundCoverUrl || ''
+      return {
+        id,
+        name:   pl.name ?? name,
+        cover:  rawCover ? toHttps(rawCover) : (tracks[0]?.cover ?? ''),
+        tracks,
+      }
+    })
+  )
+  return results
+    .filter((r): r is PromiseFulfilledResult<ChartCard> => r.status === 'fulfilled')
+    .map(r => r.value)
+}
+
+// ── 新歌推荐 ──────────────────────────────────────────────────────
+export async function getNewSongs(limit = 16): Promise<ReturnType<typeof mapSong>[]> {
+  try {
+    const res = await http('/api/personalized/newsong', { limit, csrf_token: '' })
+    return ((res.result ?? []) as any[]).map((item: any) => {
+      const s = item.song
+      const cover = s.album?.blurPicUrl ?? s.album?.picUrl ?? ''
+      return mapSong(s, cover)
+    })
+  } catch { return [] }
+}
+
 // ── 获取播放 URL ──────────────────────────────────────────────────
 export async function getUrl(id: string): Promise<{ url: string | null; cover?: string }> {
   const realId = id.replace('netease_', '')

@@ -20,6 +20,9 @@ import { setupTray } from './modules/tray'
 import { setupAutoLaunch } from './modules/autoLaunch'
 import { setupIPC } from './modules/ipc'
 import { setupMusicIPC } from './modules/music/index'
+import { startTracking, setupActivityIPC, flushAndStop } from './modules/activityTracker'
+import { startNavServer, setupNavIPC } from './modules/navServer'
+import { setupWallpaperEngineIPC, shutdownWallpaperEngine } from './modules/wallpaperEngine'
 
 // Windows 11 任务栏媒体控制 (SMTC) 必须在 app ready 前设置
 app.commandLine.appendSwitch('enable-features', 'HardwareMediaKeyHandling,MediaSessionService')
@@ -106,8 +109,13 @@ app.whenReady().then(() => {
   setupAutoLaunch()
   setupIPC(mainWindow!)
   setupMusicIPC()
+  setupActivityIPC()
+  startTracking()
+  setupNavIPC()
+  startNavServer()
+  setupWallpaperEngineIPC()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
 })
 
 app.on('window-all-closed', () => { /* 留在托盘 */ })
-app.on('before-quit', () => { isQuitting = true })
+app.on('before-quit', () => { isQuitting = true; flushAndStop(); shutdownWallpaperEngine() })

@@ -2,6 +2,7 @@ import { useState, useRef, useMemo, useCallback, useEffect } from 'react'
 import { Search, Loader2, AlertCircle, ChevronsDown } from 'lucide-react'
 import { searchMusic, getMusicUrl, type SearchSource } from '../api/music'
 import TrackList from '../components/Music/TrackList'
+import MusicHome from './MusicHome'
 import { usePlayerStore } from '../store/player'
 import { useToastStore } from '../store/toast'
 import type { Track } from '../types'
@@ -52,18 +53,15 @@ export default function Music() {
   const toast = useToastStore()
   const inputRef = useRef<HTMLInputElement>(null)
 
-  // 每次状态变化都持久化会话
   useEffect(() => {
     saveSession({ query, source, tracks: allTracks, offsets })
   }, [query, source, allTracks, offsets])
 
-  // ── 客户端过滤 ─────────────────────────────────────────────────
   const filteredTracks = useMemo<Track[]>(() => {
     if (source === 'all') return allTracks
     return allTracks.filter((t) => t.source === source)
   }, [allTracks, source])
 
-  // ── 首次搜索（清空结果）────────────────────────────────────────
   const handleSearch = useCallback(async (q = query) => {
     const trimmed = q.trim()
     if (!trimmed) return
@@ -81,15 +79,11 @@ export default function Music() {
     }
   }, [query])
 
-  // ── 加载更多 ───────────────────────────────────────────────────
   const handleLoadMore = useCallback(async () => {
     const trimmed = query.trim()
     if (!trimmed || status === 'loadingMore') return
-
-    // 当前 tab 用哪个 offset
     const activeSource = source === 'all' ? 'all' : source
     const offset = offsets[activeSource] ?? 30
-
     setStatus('loadingMore')
     try {
       const more = await searchMusic(trimmed, activeSource, offset)
@@ -99,7 +93,6 @@ export default function Music() {
         return
       }
       setAllTracks((prev) => {
-        // 去重后追加
         const existingIds = new Set(prev.map((t) => t.id))
         const fresh = more.filter((t) => !existingIds.has(t.id))
         const next = [...prev, ...fresh]
@@ -133,9 +126,22 @@ export default function Music() {
     return m
   }, [allTracks])
 
+  const handleHomeSearch = useCallback((q: string) => {
+    setQuery(q)
+    handleSearch(q)
+  }, [handleSearch])
+
+  // 有搜索结果（或正在搜索/出错）时显示结果区，否则显示首页
+  const showResults = status !== 'idle' || allTracks.length > 0
+
+  function clearSearch() {
+    setQuery(''); setAllTracks([]); setStatus('idle'); setOffsets({})
+    inputRef.current?.focus()
+  }
+
   return (
     <div className="flex h-full flex-col">
-      {/* ── 顶栏 ──────────────────────────────────────────────── */}
+      {/* ── 顶栏：始终显示的搜索框 ────────────────────────────── */}
       <div className="flex flex-col gap-2 border-b border-dividerLight px-4 py-3">
         <div className="flex items-center gap-2 rounded border border-divider bg-primaryDark px-3 py-2 focus-within:border-dividerDark transition-colors">
           {status === 'loading'
@@ -151,43 +157,43 @@ export default function Music() {
             className="flex-1 bg-transparent text-body text-secondaryDark placeholder:text-secondary placeholder:opacity-50 focus:outline-none"
           />
           {query && (
-            <button onClick={() => { setQuery(''); setAllTracks([]); setStatus('idle'); inputRef.current?.focus() }}
-              className="text-secondaryLight hover:text-secondary text-tiny">✕</button>
+            <button onClick={clearSearch} className="text-secondaryLight hover:text-secondary text-tiny">✕</button>
           )}
         </div>
 
-        {/* 来源过滤 tabs */}
-        <div className="flex items-center gap-1">
-          {SOURCES.map((s) => (
-            <button
-              key={s.id}
-              onClick={() => setSource(s.id)}
-              className={[
-                'flex items-center gap-1 rounded px-2.5 py-1 text-tiny transition-colors',
-                source === s.id ? 'bg-primaryDark text-accent' : 'text-secondary hover:bg-primaryDark hover:text-secondaryDark',
-              ].join(' ')}
-            >
-              {s.label}
-              {status === 'done' && sourceCounts[s.id] > 0 && (
-                <span className={['tabular-nums', source === s.id ? 'text-accent opacity-70' : 'opacity-40'].join(' ')}>
-                  {sourceCounts[s.id]}
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
+        {/* 来源过滤（仅有搜索结果时显示） */}
+        {showResults && (
+          <div className="flex items-center gap-1">
+            {SOURCES.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => setSource(s.id)}
+                className={[
+                  'flex items-center gap-1 rounded px-2.5 py-1 text-tiny transition-colors',
+                  source === s.id ? 'bg-primaryDark text-accent' : 'text-secondary hover:bg-primaryDark hover:text-secondaryDark',
+                ].join(' ')}
+              >
+                {s.label}
+                {status === 'done' && sourceCounts[s.id] > 0 && (
+                  <span className={['tabular-nums', source === s.id ? 'text-accent opacity-70' : 'opacity-40'].join(' ')}>
+                    {sourceCounts[s.id]}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* ── 内容区 ────────────────────────────────────────────── */}
-      <div className="flex flex-1 flex-col overflow-y-auto">
-        {status === 'idle' && (
-          <div className="flex flex-1 h-full flex-col items-center justify-center gap-2 text-center">
-            <span className="ms-icon text-5xl text-dividerDark">music_note</span>
-            <p className="text-body text-secondaryLight">搜索你喜欢的音乐</p>
-            <p className="text-tiny text-secondary opacity-60">支持网易云、QQ 音乐、酷狗，Enter 搜索</p>
-          </div>
-        )}
+      <div className="flex flex-1 flex-col overflow-hidden">
 
+        {/* 首页发现（空搜索时） */}
+        {!showResults && <MusicHome onSearch={handleHomeSearch} />}
+
+        {/* 搜索结果 */}
+        {showResults && (
+        <div className="flex flex-1 flex-col overflow-y-auto">
         {status === 'loading' && (
           <div className="flex flex-1 h-full items-center justify-center">
             <Loader2 size={20} className="animate-spin text-accent" />
@@ -215,7 +221,6 @@ export default function Music() {
               {source !== 'all' && <span className="text-accent mr-1">{SOURCES.find(s => s.id === source)?.label}</span>}
               共 <span className="text-accent">{filteredTracks.length}</span> 条，双击播放
             </p>
-
             <TrackList
               tracks={filteredTracks}
               activeId={currentTrack?.id ?? null}
@@ -223,8 +228,6 @@ export default function Music() {
               onPlay={handlePlay}
               showAdd
             />
-
-            {/* 加载更多 */}
             <div className="mt-4 flex justify-center">
               <button
                 onClick={handleLoadMore}
@@ -237,6 +240,8 @@ export default function Music() {
               </button>
             </div>
           </div>
+        )}
+        </div>
         )}
       </div>
     </div>

@@ -17,6 +17,21 @@ export async function getMusicLyric(id: string): Promise<LyricLine[]> {
   return parseLRC(raw || '')
 }
 
+// ── 发现页 ────────────────────────────────────────────────────────
+export interface ChartCard {
+  id: number
+  name: string
+  cover: string
+  tracks: Track[]
+}
+export interface DiscoverData {
+  charts: ChartCard[]
+  newSongs: Track[]
+}
+export async function getDiscover(): Promise<DiscoverData> {
+  return window.electron.invoke<DiscoverData>('music:discover')
+}
+
 // ── 认证 ─────────────────────────────────────────────────────────
 export async function getAuthStatus(): Promise<{ netease: boolean; qq: boolean }> {
   return window.electron.invoke('auth:status')

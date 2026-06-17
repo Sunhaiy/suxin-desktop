@@ -1,10 +1,12 @@
 import { NavLink } from 'react-router-dom'
-import { Music2, ListMusic, Terminal, Settings } from 'lucide-react'
+import { Music2, ListMusic, Terminal, Activity, Monitor, Settings } from 'lucide-react'
 
 const topNav = [
-  { to: '/music',      Icon: Music2,     label: '音乐' },
-  { to: '/playlists',  Icon: ListMusic,  label: '歌单' },
-  { to: '/automation', Icon: Terminal,   label: '自动化' },
+  { to: '/music',      Icon: Music2,    label: '音乐' },
+  { to: '/playlists',  Icon: ListMusic, label: '歌单' },
+  { to: '/automation', Icon: Terminal,  label: '自动化' },
+  { to: '/activity',   Icon: Activity,  label: '活动日志' },
+  { to: '/wallpaper',  Icon: Monitor,   label: '壁纸' },
 ]
 
 const bottomNav = [

@@ -20,5 +20,7 @@ interface Window {
       remove: (key: string) => Promise<void>
     }
     invoke: <T = unknown>(channel: string, payload?: unknown) => Promise<T>
+    /** 监听主进程推送事件，返回取消监听函数 */
+    on: (channel: string, cb: (...args: unknown[]) => void) => () => void
   }
 }

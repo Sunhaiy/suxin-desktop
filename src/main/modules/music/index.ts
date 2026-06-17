@@ -47,6 +47,18 @@ export function setupMusicIPC(): void {
     }
   })
 
+  // ── 发现页（排行榜 + 新歌推荐）────────────────────────────────────
+  ipcMain.handle('music:discover', async () => {
+    const [charts, newSongs] = await Promise.allSettled([
+      netease.getCharts(),
+      netease.getNewSongs(18),
+    ])
+    return {
+      charts:   charts.status   === 'fulfilled' ? charts.value   : [],
+      newSongs: newSongs.status === 'fulfilled' ? newSongs.value : [],
+    }
+  })
+
   // ── 歌词 ───────────────────────────────────────────────────────
   ipcMain.handle('music:getLyric', async (_e, { id }: { id: string }) => {
     if (!id.startsWith('netease_')) return ''
