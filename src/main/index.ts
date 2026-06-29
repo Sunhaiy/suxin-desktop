@@ -20,7 +20,7 @@ import { setupTray } from './modules/tray'
 import { setupAutoLaunch } from './modules/autoLaunch'
 import { setupIPC } from './modules/ipc'
 import { setupMusicIPC } from './modules/music/index'
-import { startTracking, setupActivityIPC, flushAndStop } from './modules/activityTracker'
+import { initializeTracking, setupActivityIPC, flushAndStop } from './modules/activityTracker'
 import { startNavServer, setupNavIPC } from './modules/navServer'
 import { setupWallpaperEngineIPC, shutdownWallpaperEngine } from './modules/wallpaperEngine'
 import { setupLocalWallpaperIPC } from './modules/localWallpaper'
@@ -38,6 +38,16 @@ app.commandLine.appendSwitch('proxy-bypass-list', '<local>;127.0.0.1;::1;192.168
 
 let mainWindow: BrowserWindow | null = null
 let isQuitting = false
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) app.quit()
+
+app.on('second-instance', () => {
+  if (!mainWindow) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+})
 
 // ── 读取 WinInet 系统代理并显式写入 session，确保 Electron 走 Clash/v2ray ──
 async function syncSystemProxy(): Promise<void> {
@@ -98,7 +108,7 @@ function setupSessionHeaders() {
   )
 }
 
-function createWindow(): void {
+function createWindow(showOnReady = true): void {
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 750,
@@ -116,7 +126,7 @@ function createWindow(): void {
     },
   })
 
-  mainWindow.on('ready-to-show', () => mainWindow?.show())
+  mainWindow.on('ready-to-show', () => { if (showOnReady) mainWindow?.show() })
   mainWindow.on('close', (e) => {
     if (!isQuitting) { e.preventDefault(); mainWindow?.hide() }
   })
@@ -130,7 +140,7 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(async () => {
+if (hasSingleInstanceLock) app.whenReady().then(async () => {
   await syncSystemProxy()   // 先同步代理，再创建窗口
 
   // 本地图片协议处理
@@ -143,18 +153,19 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('com.suxin.desktop')
   app.setName('SuXin Desktop')
   setupSessionHeaders()
-  createWindow()
+  const openedAtLogin = app.getLoginItemSettings().wasOpenedAtLogin
+  createWindow(!openedAtLogin)
   if (mainWindow) setupTray(mainWindow, () => { isQuitting = true })
   setupAutoLaunch()
   setupIPC(mainWindow!)
   setupMusicIPC()
   setupActivityIPC()
-  startTracking()
+  initializeTracking()
   setupNavIPC()
   startNavServer()
   setupWallpaperEngineIPC()
   setupLocalWallpaperIPC()
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(true) })
 })
 
 app.on('window-all-closed', () => { /* 留在托盘 */ })

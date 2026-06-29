@@ -73,21 +73,24 @@ export default function Settings() {
   const [navUrl,        setNavUrl]        = useState('http://localhost:9900')
   const [navPortBusy,   setNavPortBusy]   = useState(false)
   const [copied,        setCopied]        = useState(false)
+  const [activityDir,   setActivityDir]   = useState('')
   const toast = useToastStore()
 
   async function refresh() {
-    const [status, al, ver, port, url] = await Promise.all([
+    const [status, al, ver, port, url, trackingDir] = await Promise.all([
       getAuthStatus(),
       window.electron?.app.getAutoLaunch(),
       window.electron?.app.version(),
       window.electron.invoke<number>('nav:getPort'),
       window.electron.invoke<string>('nav:getUrl'),
+      window.electron.invoke<string>('activity:getDataDir'),
     ])
     setAuth(status)
     setAutoLaunch(al ?? false)
     setVersion(ver ?? '')
     if (port)  { setNavPort(port);  setNavPortInput(String(port)) }
     if (url)   setNavUrl(url)
+    if (trackingDir) setActivityDir(trackingDir)
   }
 
   useEffect(() => { refresh() }, [])
@@ -154,6 +157,14 @@ export default function Settings() {
           <p className="mb-2 text-tiny font-semibold uppercase tracking-wider text-secondaryLight">通用</p>
           <SettingRow label="开机自启" description="系统启动时自动在后台运行">
             <Toggle value={autoLaunch} onChange={handleAutoLaunch} />
+          </SettingRow>
+          <SettingRow label="活动记录目录" description={activityDir || '软件目录下的 activity 文件夹'}>
+            <button
+              onClick={() => window.electron.invoke('activity:openDataDir')}
+              className="flex items-center gap-1.5 rounded px-2.5 py-1 text-tiny text-secondary transition-colors hover:bg-primaryDark hover:text-secondaryDark"
+            >
+              <FolderOpen size={12} /> 打开
+            </button>
           </SettingRow>
         </section>
 

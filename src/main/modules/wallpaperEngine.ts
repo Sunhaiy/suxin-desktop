@@ -795,11 +795,12 @@ function buildVideoPage(filePath: string, volume: number): string {
   return `<!DOCTYPE html><html><head>
 <style>*{margin:0;padding:0}body{background:#000;overflow:hidden}video{width:100vw;height:100vh;object-fit:cover}</style>
 </head><body>
-<video autoplay loop muted playsinline>
+<video autoplay loop playsinline>
   <source src="${url}">
 </video>
 <script>
   const v=document.querySelector('video')
+  v.defaultMuted=false
   v.volume=${volume}
   v.muted=${volume === 0}
   v.play().catch(()=>{})
@@ -836,37 +837,44 @@ async function startEngine(cfg: EngineConfig): Promise<void> {
     win = await createWindow()
     embedded = false
   }
+  const wallpaperWindow = win
+  if (!wallpaperWindow) return
+
+  wallpaperWindow.webContents.setAudioMuted(cfg.volume === 0)
+  wallpaperWindow.webContents.once('did-finish-load', () => { void applyEngineVolume(cfg.volume) })
 
   if (source.type === 'theme') {
     const htmlPath = path.join(getThemeDir(), `${source.id}.html`)
-    win.loadFile(htmlPath)
+    wallpaperWindow.loadFile(htmlPath)
   } else if (source.type === 'web') {
     // Wallpaper Engine web-type: load the HTML file directly from its own directory
     if (!source.path || !fs.existsSync(source.path)) return
-    win.loadFile(source.path)
+    wallpaperWindow.loadFile(source.path)
   } else {
     if (!source.path || !fs.existsSync(source.path)) return
     const tmpHtml = path.join(getDataBase(), '_wallpaper-video.html')
     fs.writeFileSync(tmpHtml, buildVideoPage(source.path, cfg.volume))
-    win.loadFile(tmpHtml)
+    wallpaperWindow.loadFile(tmpHtml)
   }
 
   if (!embedded) {
     // Remove any stale handler from a previous startEngine call that hasn't fired yet
-    if (loadHandler) { win.webContents.removeListener('did-finish-load', loadHandler); loadHandler = null }
+    if (loadHandler) { wallpaperWindow.webContents.removeListener('did-finish-load', loadHandler); loadHandler = null }
     loadHandler = async () => {
       loadHandler = null
-      if (!win || win.isDestroyed()) return
-      const hwnd = getHwnd(win)
+      let target = win
+      if (!target || target.isDestroyed()) return
+      const hwnd = getHwnd(target)
 
       // Chromium's GPU swap chain must be initialized BEFORE SetParent.
       // Cross-process reparenting after init preserves the rendering pipeline.
       // Show at opacity 0 to avoid a visible flash before the window is embedded.
-      win.setOpacity(0)
-      win.showInactive()
+      target.setOpacity(0)
+      target.showInactive()
       await new Promise(r => setTimeout(r, 500))
 
-      if (!win || win.isDestroyed()) return
+      target = win
+      if (!target || target.isDestroyed()) return
       console.log('[wallpaperEngine] embedding hwnd=' + hwnd)
       try {
         await embedInDesktop(hwnd)
@@ -875,10 +883,11 @@ async function startEngine(cfg: EngineConfig): Promise<void> {
       } catch (e) {
         console.error('[wallpaperEngine] embed failed:', e)
       }
-      if (!win || win.isDestroyed()) return
-      win.setOpacity(1)
+      target = win
+      if (!target || target.isDestroyed()) return
+      target.setOpacity(1)
     }
-    win.webContents.once('did-finish-load', loadHandler)
+    wallpaperWindow.webContents.once('did-finish-load', loadHandler)
   }
   paused = false
 }
@@ -897,6 +906,25 @@ function stopEngine(): void {
 async function execInWin(js: string): Promise<void> {
   if (!win || win.isDestroyed()) return
   try { await win.webContents.executeJavaScript(js) } catch {}
+}
+
+async function applyEngineVolume(volume: number): Promise<void> {
+  if (!win || win.isDestroyed()) return
+  const value = Math.max(0, Math.min(1, Number(volume) || 0))
+
+  // Chromium has both a WebContents mute flag and per-element mute flags.
+  // Keep them in sync so a muted autoplay does not remain silent until reload.
+  win.webContents.setAudioMuted(value === 0)
+  await execInWin(`
+    (() => {
+      const volume = ${value};
+      document.querySelectorAll('video, audio').forEach(media => {
+        media.defaultMuted = false;
+        media.muted = volume === 0;
+        media.volume = volume;
+      });
+    })()
+  `)
 }
 
 // ── Steam Workshop scanner ────────────────────────────────────────────────────
@@ -1062,9 +1090,10 @@ export function setupWallpaperEngineIPC(): void {
   })
 
   ipcMain.handle('wallpaper:setVolume', async (_e, volume: number) => {
-    const c = { ...loadConfig(), volume }
+    const value = Math.max(0, Math.min(1, Number(volume) || 0))
+    const c = { ...loadConfig(), volume: value }
     saveConfig(c)
-    await execInWin(`const v=document.querySelector('video');if(v){v.volume=${volume};v.muted=${volume === 0}}`)
+    await applyEngineVolume(value)
   })
 
   ipcMain.handle('wallpaper:setPaused', async (_e, p: boolean) => {

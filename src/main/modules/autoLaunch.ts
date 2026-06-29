@@ -1,13 +1,7 @@
 import { app } from 'electron'
 
 export function setupAutoLaunch(): void {
-  // 仅在打包后的生产环境启用，开发模式不自启
-  if (app.isPackaged) {
-    app.setLoginItemSettings({
-      openAtLogin: true,
-      openAsHidden: true,
-    })
-  }
+  // Do not overwrite the user's existing login preference on every launch.
 }
 
 export function setAutoLaunch(enable: boolean): void {
