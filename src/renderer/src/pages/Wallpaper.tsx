@@ -12,7 +12,7 @@ interface Theme {
 
 interface EngineConfig {
   enabled: boolean
-  source?: { type: 'theme' | 'video' | 'web' | 'scene'; id: string; path?: string }
+  source?: { type: 'theme' | 'video' | 'web'; id: string; path?: string }
   volume: number
 }
 
@@ -25,7 +25,7 @@ interface LocalImage {
 interface WorkshopItem {
   id: string
   title: string
-  type: 'video' | 'web' | 'scene'
+  type: 'video' | 'web'
   file: string
   preview: string
   tags: string[]
@@ -34,7 +34,6 @@ interface WorkshopItem {
 
 interface WorkshopScanResult {
   directory: string
-  sceneSupport: boolean
   items: WorkshopItem[]
 }
 
@@ -117,14 +116,14 @@ function VideoCard({ filePath, active, onPlay, onRemove }: {
   )
 }
 
-function WorkshopCard({ item, active, disabled, onApply }: {
-  item: WorkshopItem; active: boolean; disabled: boolean; onApply: () => void
+function WorkshopCard({ item, active, onApply }: {
+  item: WorkshopItem; active: boolean; onApply: () => void
 }) {
-  const typeLabel = item.type === 'scene' ? '场景' : item.type === 'web' ? '网页' : '视频'
+  const typeLabel = item.type === 'web' ? '网页' : '视频'
   return (
-    <button onClick={onApply} disabled={disabled}
-      className={['group overflow-hidden rounded-xl border text-left transition-all disabled:cursor-not-allowed disabled:opacity-55',
-        active ? 'border-accent ring-1 ring-accent/40' : 'border-white/8 hover:border-white/20'].join(' ')}>
+    <button onClick={onApply}
+      className={['group overflow-hidden rounded-xl text-left transition-all',
+        active ? 'ring-2 ring-accent/60' : 'hover:bg-white/[0.025]'].join(' ')}>
       <div className="relative h-28 overflow-hidden bg-primaryDark">
         {item.preview ? (
           <img src={item.preview} alt={item.title} loading="lazy"
@@ -140,7 +139,7 @@ function WorkshopCard({ item, active, disabled, onApply }: {
       <div className="flex items-center justify-between gap-2 px-2.5 py-2">
         <span className="truncate text-[10px] text-secondary">Workshop #{item.id}</span>
         <span className="flex-shrink-0 text-[11px] text-accent">
-          {disabled ? '需安装 Wallpaper Engine' : active ? '重新应用' : '应用'}
+          {active ? '重新应用' : '应用'}
         </span>
       </div>
     </button>
@@ -180,7 +179,7 @@ export default function Wallpaper() {
   const [paused,      setPausedState] = useState(false)
   const [tab,         setTab]        = useState<Tab>('theme')
   const [recentVids,  setRecentVids] = useState<string[]>([])
-  const [workshop, setWorkshop] = useState<WorkshopScanResult>({ directory: '', sceneSupport: false, items: [] })
+  const [workshop, setWorkshop] = useState<WorkshopScanResult>({ directory: '', items: [] })
   const [workshopStatus, setWorkshopStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
 
   // 本地壁纸状态
@@ -219,7 +218,7 @@ export default function Wallpaper() {
     setWorkshopStatus('loading')
     try {
       const result = await window.electron.invoke<WorkshopScanResult>('wallpaper:scanWorkshop')
-      setWorkshop(result ?? { directory: '', sceneSupport: false, items: [] })
+      setWorkshop(result ?? { directory: '', items: [] })
       setWorkshopStatus('done')
     } catch {
       setWorkshopStatus('error')
@@ -321,7 +320,7 @@ export default function Wallpaper() {
     await window.electron.invoke('wallpaper:setVolume', v)
   }
 
-  const isVideoLike   = config.source?.type === 'video' || config.source?.type === 'web' || config.source?.type === 'scene'
+  const isVideoLike   = config.source?.type === 'video' || config.source?.type === 'web'
   const activeThemeId = config.enabled && config.source?.type === 'theme' ? config.source.id : null
   const activeVideo   = config.enabled && config.source?.type === 'video'  ? config.source.path : null
 
@@ -430,13 +429,12 @@ export default function Wallpaper() {
             {workshopStatus === 'done' && workshop.items.length > 0 && (
               <>
                 <p className="text-[10px] text-secondary opacity-60">
-                  已识别 {workshop.items.length} 个视频、网页或场景壁纸；场景壁纸由 Wallpaper Engine 渲染。
+                  已识别 {workshop.items.length} 个可独立运行的视频或网页壁纸，不会启动 Wallpaper Engine。
                 </p>
                 <div className="grid grid-cols-3 gap-3">
                   {workshop.items.map(item => (
                     <WorkshopCard key={item.id} item={item}
                       active={config.enabled && config.source?.id === `workshop:${item.id}`}
-                      disabled={item.type === 'scene' && !workshop.sceneSupport}
                       onApply={() => setWorkshopSource(item)} />
                   ))}
                 </div>

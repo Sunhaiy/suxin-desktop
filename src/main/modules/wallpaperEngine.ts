@@ -653,12 +653,22 @@ function getConfigPath(): string { return path.join(getDataBase(), 'wallpaper-en
 
 interface EngineConfig {
   enabled: boolean
-  source?: { type: 'theme' | 'video' | 'web' | 'scene'; id: string; path?: string }
+  source?: { type: 'theme' | 'video' | 'web'; id: string; path?: string }
   volume:  number
 }
 
 function loadConfig(): EngineConfig {
-  try { return JSON.parse(fs.readFileSync(getConfigPath(), 'utf8')) }
+  try {
+    const config = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8')) as EngineConfig & {
+      source?: { type?: string; id?: string; path?: string }
+    }
+    // Older builds delegated proprietary Workshop scenes to Wallpaper Engine.
+    // This app now stays fully independent, so discard that legacy source.
+    if (config.source && !['theme', 'video', 'web'].includes(config.source.type ?? '')) {
+      return { enabled: false, volume: Number(config.volume) || 0 }
+    }
+    return config as EngineConfig
+  }
   catch { return { enabled: false, volume: 0 } }
 }
 
@@ -778,7 +788,6 @@ let win:         BrowserWindow | null = null
 let paused       = false
 let embedded     = false
 let loadHandler: (() => Promise<void>) | null = null
-let externalEngineActive = false
 
 function buildVideoPage(filePath: string, volume: number): string {
   // Use forward slashes and proper file:// URL
@@ -821,22 +830,6 @@ async function startEngine(cfg: EngineConfig): Promise<void> {
   if (!cfg.source) return
 
   const { source } = cfg
-
-  // Scene wallpapers use Wallpaper Engine's proprietary renderer. Its official
-  // CLI accepts project.json, so scene.pkg never needs to be unpacked here.
-  if (source.type === 'scene') {
-    if (!source.path || !fs.existsSync(source.path)) throw new Error('场景壁纸文件不存在')
-    destroyInternalEngine()
-    await runWallpaperEngineControl(['openWallpaper', '-file', source.path])
-    externalEngineActive = true
-    paused = false
-    return
-  }
-
-  if (externalEngineActive) {
-    await runWallpaperEngineControl(['stop']).catch(() => {})
-    externalEngineActive = false
-  }
 
   const needEmbed = !win || win.isDestroyed()
   if (needEmbed) {
@@ -890,7 +883,7 @@ async function startEngine(cfg: EngineConfig): Promise<void> {
   paused = false
 }
 
-function destroyInternalEngine(): void {
+function stopEngine(): void {
   if (win && !win.isDestroyed()) {
     if (loadHandler) { win.webContents.removeListener('did-finish-load', loadHandler) }
     win.destroy()
@@ -899,14 +892,6 @@ function destroyInternalEngine(): void {
   paused = false
   embedded = false
   loadHandler = null
-}
-
-async function stopEngine(): Promise<void> {
-  destroyInternalEngine()
-  if (externalEngineActive) {
-    await runWallpaperEngineControl(['stop']).catch(() => {})
-    externalEngineActive = false
-  }
 }
 
 async function execInWin(js: string): Promise<void> {
@@ -919,8 +904,8 @@ async function execInWin(js: string): Promise<void> {
 export interface WorkshopItem {
   id:          string
   title:       string
-  type:        'video' | 'web' | 'scene'
-  file:        string   // video/html path, or project.json for scene wallpapers
+  type:        'video' | 'web'
+  file:        string   // absolute video or HTML path
   preview:     string   // local-img:// URL (may be empty)
   tags:        string[]
   description: string
@@ -928,7 +913,6 @@ export interface WorkshopItem {
 
 export interface WorkshopScanResult {
   directory: string
-  sceneSupport: boolean
   items: WorkshopItem[]
 }
 
@@ -989,23 +973,6 @@ async function findWorkshopDir(): Promise<string | null> {
   return null
 }
 
-async function findWallpaperEngineExecutable(): Promise<string | null> {
-  for (const library of await getSteamLibraries()) {
-    const dir = path.join(library, 'steamapps', 'common', 'wallpaper_engine')
-    for (const exe of ['wallpaper64.exe', 'wallpaper32.exe']) {
-      const candidate = path.join(dir, exe)
-      if (fs.existsSync(candidate)) return candidate
-    }
-  }
-  return null
-}
-
-async function runWallpaperEngineControl(args: string[]): Promise<void> {
-  const executable = await findWallpaperEngineExecutable()
-  if (!executable) throw new Error('未找到 Wallpaper Engine，请先在 Steam 中安装或启动它')
-  await execFileText(executable, ['-control', ...args])
-}
-
 function safeItemPath(itemDir: string, relativePath: string): string | null {
   const resolved = path.resolve(itemDir, relativePath)
   const prefix = path.resolve(itemDir) + path.sep
@@ -1014,16 +981,15 @@ function safeItemPath(itemDir: string, relativePath: string): string | null {
 
 export async function scanWorkshopItems(): Promise<WorkshopScanResult> {
   const workshopDir = await findWorkshopDir()
-  const sceneSupport = !!(await findWallpaperEngineExecutable())
-  if (!workshopDir) return { directory: '', sceneSupport, items: [] }
+  if (!workshopDir) return { directory: '', items: [] }
 
-  if (!fs.existsSync(workshopDir)) return { directory: '', sceneSupport, items: [] }
+  if (!fs.existsSync(workshopDir)) return { directory: '', items: [] }
 
   const items: WorkshopItem[] = []
 
   let entries: fs.Dirent[]
   try { entries = fs.readdirSync(workshopDir, { withFileTypes: true }) }
-  catch { return { directory: workshopDir, sceneSupport, items: [] } }
+  catch { return { directory: workshopDir, items: [] } }
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue
@@ -1034,12 +1000,10 @@ export async function scanWorkshopItems(): Promise<WorkshopScanResult> {
     try {
       const proj = JSON.parse(fs.readFileSync(projFile, 'utf8'))
       const type = (proj.type ?? '').toLowerCase()
-      if (type !== 'video' && type !== 'web' && type !== 'scene') continue
+      if (type !== 'video' && type !== 'web') continue
 
       // Resolve main file
-      const fileName = type === 'scene'
-        ? 'project.json'
-        : (proj.file ?? (type === 'video' ? 'video.mp4' : 'index.html'))
+      const fileName = proj.file ?? (type === 'video' ? 'video.mp4' : 'index.html')
       const file = safeItemPath(itemDir, String(fileName))
       if (!file) continue
 
@@ -1069,7 +1033,6 @@ export async function scanWorkshopItems(): Promise<WorkshopScanResult> {
 
   return {
     directory: workshopDir,
-    sceneSupport,
     items: items.sort((a, b) => a.title.localeCompare(b.title, 'zh')),
   }
 }
@@ -1095,30 +1058,22 @@ export function setupWallpaperEngineIPC(): void {
     const c = { ...loadConfig(), enabled }
     saveConfig(c)
     if (enabled && c.source) await startEngine(c)
-    else await stopEngine()
+    else stopEngine()
   })
 
   ipcMain.handle('wallpaper:setVolume', async (_e, volume: number) => {
     const c = { ...loadConfig(), volume }
     saveConfig(c)
-    if (c.source?.type === 'scene') {
-      await runWallpaperEngineControl([volume === 0 ? 'mute' : 'unmute'])
-    } else {
-      await execInWin(`const v=document.querySelector('video');if(v){v.volume=${volume};v.muted=${volume === 0}}`)
-    }
+    await execInWin(`const v=document.querySelector('video');if(v){v.volume=${volume};v.muted=${volume === 0}}`)
   })
 
   ipcMain.handle('wallpaper:setPaused', async (_e, p: boolean) => {
     paused = p
-    if (loadConfig().source?.type === 'scene') {
-      await runWallpaperEngineControl([p ? 'pause' : 'play'])
-    } else {
-      await execInWin(p ? 'document.querySelector("video")?.pause()' : 'document.querySelector("video")?.play()')
-    }
+    await execInWin(p ? 'document.querySelector("video")?.pause()' : 'document.querySelector("video")?.play()')
   })
 
   ipcMain.handle('wallpaper:getStatus', () => ({
-    active:  externalEngineActive || (!!win && !win.isDestroyed()),
+    active:  !!win && !win.isDestroyed(),
     paused,
     config:  loadConfig(),
   }))
@@ -1143,4 +1098,4 @@ export function setupWallpaperEngineIPC(): void {
   ipcMain.handle('wallpaper:openExternal', (_e, url: string) => shell.openExternal(url))
 }
 
-export function shutdownWallpaperEngine(): void { void stopEngine() }
+export function shutdownWallpaperEngine(): void { stopEngine() }
