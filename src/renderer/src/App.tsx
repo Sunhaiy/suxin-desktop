@@ -7,7 +7,6 @@ import Lyrics from './components/Player/Lyrics'
 import Toaster from './components/UI/Toaster'
 import Music from './pages/Music'
 import Playlists from './pages/Playlists'
-import Automation from './pages/Automation'
 import Settings from './pages/Settings'
 import ActivityLog from './pages/ActivityLog'
 import Wallpaper from './pages/Wallpaper'
@@ -35,7 +34,6 @@ export default function App() {
               <Route path="/" element={<Navigate to="/music" replace />} />
               <Route path="/music" element={<Music />} />
               <Route path="/playlists" element={<Playlists />} />
-              <Route path="/automation" element={<Automation />} />
               <Route path="/activity"   element={<ActivityLog />} />
               <Route path="/wallpaper" element={<Wallpaper />} />
               <Route path="/settings" element={<Settings />} />

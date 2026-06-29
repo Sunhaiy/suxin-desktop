@@ -72,12 +72,11 @@ function mapSong(s: any, rawCover: string) {
   }
 }
 
-// ── 排行榜（热歌/新歌/飙升） ────────────────────────────────────────
-const CHART_IDS = [
-  { id: 3778678,  name: '热歌榜' },
-  { id: 3779629,  name: '新歌榜' },
-  { id: 19723756, name: '飙升榜' },
-]
+// ── 排行榜 ─────────────────────────────────────────────────────────
+function imgUrl(raw: string, size: number): string {
+  if (!raw) return ''
+  return `${toHttps(raw.split('?')[0])}?param=${size}y${size}`
+}
 
 export interface ChartCard {
   id: number
@@ -87,27 +86,68 @@ export interface ChartCard {
 }
 
 export async function getCharts(): Promise<ChartCard[]> {
+  // Fetch chart list with cover images from toplist API
+  let chartMeta: { id: number; name: string; cover: string }[]
+  try {
+    const topRes = await http('/api/toplist/detail', {})
+    const rawList: any[] = topRes.list ?? []
+    chartMeta = rawList.slice(0, 6).map((c: any) => ({
+      id:    c.id as number,
+      name:  c.name as string,
+      cover: imgUrl(c.coverImgUrl ?? '', 512),
+    }))
+    if (!chartMeta.length) throw new Error('empty')
+  } catch {
+    // Fallback to hardcoded IDs
+    chartMeta = [
+      { id: 3778678,  name: '热歌榜', cover: '' },
+      { id: 3779629,  name: '新歌榜', cover: '' },
+      { id: 19723756, name: '飙升榜', cover: '' },
+    ]
+  }
+
   const results = await Promise.allSettled(
-    CHART_IDS.map(async ({ id, name }) => {
-      const res = await http('/api/playlist/detail', {
-        id, t: -1, n: 10, s: 0, csrf_token: '',
-      })
-      const pl = res.playlist ?? {}
+    chartMeta.map(async ({ id, name, cover }) => {
+      const res = await http('/api/playlist/detail', { id, n: 10, s: 0, csrf_token: '' })
+      const pl  = res.playlist ?? {}
       const tracks = ((pl.tracks ?? []) as any[])
         .slice(0, 5)
         .map((s: any) => mapSong(s, s.al?.picUrl ?? ''))
-      const rawCover = pl.coverImgUrl || pl.picUrl || pl.backgroundCoverUrl || ''
       return {
         id,
         name:   pl.name ?? name,
-        cover:  rawCover ? toHttps(rawCover) : (tracks[0]?.cover ?? ''),
+        cover:  cover || imgUrl(pl.coverImgUrl ?? pl.picUrl ?? tracks[0]?.cover ?? '', 512),
         tracks,
       }
     })
   )
+
   return results
     .filter((r): r is PromiseFulfilledResult<ChartCard> => r.status === 'fulfilled')
     .map(r => r.value)
+    .filter(c => c.tracks.length > 0)
+}
+
+// ── 推荐歌单 ─────────────────────────────────────────────────────────
+export interface PlaylistCard {
+  id: number
+  name: string
+  cover: string
+  playCount: number
+  description: string
+}
+
+export async function getRecommendedPlaylists(limit = 9): Promise<PlaylistCard[]> {
+  try {
+    const res = await http('/api/personalized', { limit, csrf_token: '' })
+    return ((res.result ?? []) as any[]).map((pl: any) => ({
+      id:          pl.id,
+      name:        pl.name,
+      cover:       pl.picUrl ? `${toHttps(pl.picUrl.split('?')[0])}?param=512y512` : '',
+      playCount:   pl.playCount ?? 0,
+      description: pl.copywriter ?? '',
+    }))
+  } catch { return [] }
 }
 
 // ── 新歌推荐 ──────────────────────────────────────────────────────

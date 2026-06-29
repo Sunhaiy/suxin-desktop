@@ -47,15 +47,17 @@ export function setupMusicIPC(): void {
     }
   })
 
-  // ── 发现页（排行榜 + 新歌推荐）────────────────────────────────────
+  // ── 发现页（排行榜 + 推荐歌单 + 新歌推荐）────────────────────────
   ipcMain.handle('music:discover', async () => {
-    const [charts, newSongs] = await Promise.allSettled([
+    const [charts, playlists, newSongs] = await Promise.allSettled([
       netease.getCharts(),
+      netease.getRecommendedPlaylists(9),
       netease.getNewSongs(18),
     ])
     return {
-      charts:   charts.status   === 'fulfilled' ? charts.value   : [],
-      newSongs: newSongs.status === 'fulfilled' ? newSongs.value : [],
+      charts:    charts.status    === 'fulfilled' ? charts.value    : [],
+      playlists: playlists.status === 'fulfilled' ? playlists.value : [],
+      newSongs:  newSongs.status  === 'fulfilled' ? newSongs.value  : [],
     }
   })
 

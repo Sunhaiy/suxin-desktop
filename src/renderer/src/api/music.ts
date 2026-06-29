@@ -24,8 +24,16 @@ export interface ChartCard {
   cover: string
   tracks: Track[]
 }
+export interface PlaylistCard {
+  id: number
+  name: string
+  cover: string
+  playCount: number
+  description: string
+}
 export interface DiscoverData {
   charts: ChartCard[]
+  playlists: PlaylistCard[]
   newSongs: Track[]
 }
 export async function getDiscover(): Promise<DiscoverData> {

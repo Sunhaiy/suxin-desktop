@@ -1,4 +1,4 @@
-import { app, BrowserWindow, session } from 'electron'
+import { app, BrowserWindow, session, protocol, net } from 'electron'
 import { join } from 'path'
 import { networkInterfaces } from 'os'
 
@@ -10,8 +10,8 @@ import { networkInterfaces } from 'os'
 function getLanIP(): string {
   const nets = networkInterfaces()
   for (const iface of Object.values(nets ?? {})) {
-    for (const net of iface ?? []) {
-      if (net.family === 'IPv4' && !net.internal) return net.address
+    for (const ni of iface ?? []) {
+      if (ni.family === 'IPv4' && !ni.internal) return ni.address
     }
   }
   return 'localhost'
@@ -23,15 +23,45 @@ import { setupMusicIPC } from './modules/music/index'
 import { startTracking, setupActivityIPC, flushAndStop } from './modules/activityTracker'
 import { startNavServer, setupNavIPC } from './modules/navServer'
 import { setupWallpaperEngineIPC, shutdownWallpaperEngine } from './modules/wallpaperEngine'
+import { setupLocalWallpaperIPC } from './modules/localWallpaper'
+
+// local-img:// 协议必须在 app ready 前注册
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'local-img', privileges: { bypassCSP: true, corsEnabled: true, supportFetchAPI: true } },
+])
 
 // Windows 11 任务栏媒体控制 (SMTC) 必须在 app ready 前设置
 app.commandLine.appendSwitch('enable-features', 'HardwareMediaKeyHandling,MediaSessionService')
 
-// 不走系统代理（解决开启 v2rayN/Clash 时 localhost 无法访问的问题）
-app.commandLine.appendSwitch('no-proxy-server')
+// 绕过本地地址的代理，外部域名（如 konachan.net）仍走系统代理（v2rayN/Clash）
+app.commandLine.appendSwitch('proxy-bypass-list', '<local>;127.0.0.1;::1;192.168.0.0/16;10.0.0.0/8')
 
 let mainWindow: BrowserWindow | null = null
 let isQuitting = false
+
+// ── 读取 WinInet 系统代理并显式写入 session，确保 Electron 走 Clash/v2ray ──
+async function syncSystemProxy(): Promise<void> {
+  if (process.platform !== 'win32') return
+  try {
+    const { execSync } = await import('child_process')
+    const r1 = execSync(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable',
+      { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
+    )
+    if (!r1.includes('0x1')) return  // 系统代理未启用（纯 TUN 模式）
+    const r2 = execSync(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer',
+      { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
+    )
+    const m = r2.match(/ProxyServer\s+REG_SZ\s+(.+)/)
+    if (!m) return
+    const addr = m[1].trim()  // 形如 "127.0.0.1:7897"
+    await session.defaultSession.setProxy({
+      proxyRules: addr,
+      proxyBypassRules: '<local>;127.0.0.1;::1;192.168.0.0/16;10.0.0.0/8;172.16.0.0/12',
+    })
+  } catch { /* 读取失败，沿用自动检测 */ }
+}
 
 // ── CDN 请求拦截：注入 Referer / Origin，解决音频403问题 ─────────
 function setupSessionHeaders() {
@@ -100,7 +130,16 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await syncSystemProxy()   // 先同步代理，再创建窗口
+
+  // 本地图片协议处理
+  protocol.handle('local-img', (request) => {
+    const fp = new URL(request.url).searchParams.get('p') ?? ''
+    if (!fp) return new Response('', { status: 404 })
+    return net.fetch(`file:///${fp}`)
+  })
+
   app.setAppUserModelId('com.suxin.desktop')
   app.setName('SuXin Desktop')
   setupSessionHeaders()
@@ -114,6 +153,7 @@ app.whenReady().then(() => {
   setupNavIPC()
   startNavServer()
   setupWallpaperEngineIPC()
+  setupLocalWallpaperIPC()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
 })
 

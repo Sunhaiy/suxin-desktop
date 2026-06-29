@@ -8,11 +8,145 @@
  *   - Built-in HTML/Canvas animations (seeded to getDataBase()/wallpaper-themes/)
  *   - Local video files (mp4, webm, mkv, mov) — wrapped in a generated HTML page
  */
-import { BrowserWindow, ipcMain, screen, dialog } from 'electron'
+import { BrowserWindow, ipcMain, screen, dialog, shell } from 'electron'
 import { execFile } from 'child_process'
+import * as https from 'https'
 import fs from 'fs'
 import path from 'path'
 import { getDataBase } from './paths'
+
+// ── HTTP helpers (no key needed) ─────────────────────────────────────────────
+
+function httpGet(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url)
+    const req = https.get(
+      {
+        hostname: parsed.hostname,
+        path: parsed.pathname + parsed.search,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      },
+      res => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          resolve(httpGet(res.headers.location))
+          return
+        }
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', chunk => (data += chunk))
+        res.on('end', () => resolve(data))
+      }
+    )
+    req.on('error', reject)
+    req.setTimeout(12000, () => { req.destroy(); reject(new Error('timeout')) })
+  })
+}
+
+function httpPost(url: string, body: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url)
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        path: parsed.pathname + parsed.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      res => {
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', chunk => (data += chunk))
+        res.on('end', () => resolve(data))
+      }
+    )
+    req.on('error', reject)
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')) })
+    req.write(body)
+    req.end()
+  })
+}
+
+// ── Online Workshop browsing ──────────────────────────────────────────────────
+
+export interface OnlineWorkshopItem {
+  id: string
+  title: string
+  previewUrl: string
+  workshopUrl: string
+  type: 'video' | 'web' | 'other'
+  subscriptions: number
+  tags: string[]
+}
+
+const TYPE_TAGS = new Set(['video', 'web', 'scene', 'application', '2d', '3d'])
+
+function parseWorkshopItems(details: any[]): OnlineWorkshopItem[] {
+  return details
+    .filter((f: any) => f.result === 1 && f.title && f.preview_url)
+    .map((f: any) => {
+      const allTags: string[] = (f.tags ?? []).map((t: any) => String(t.tag ?? ''))
+      const lower = allTags.map(t => t.toLowerCase())
+      let type: OnlineWorkshopItem['type'] = 'other'
+      if (lower.includes('video')) type = 'video'
+      else if (lower.includes('web')) type = 'web'
+      return {
+        id: String(f.publishedfileid),
+        title: String(f.title),
+        previewUrl: String(f.preview_url),
+        workshopUrl: `https://steamcommunity.com/sharedfiles/filedetails/?id=${f.publishedfileid}`,
+        type,
+        subscriptions: Number(f.subscriptions ?? 0),
+        tags: allTags.filter(t => !TYPE_TAGS.has(t.toLowerCase())).slice(0, 4),
+      } as OnlineWorkshopItem
+    })
+    .filter((item: OnlineWorkshopItem) => item.type === 'video' || item.type === 'web')
+}
+
+// Primary: Steam Web API QueryFiles — works without a key, accessible from China
+async function browseViaAPI(sort: string, page: number): Promise<OnlineWorkshopItem[]> {
+  // query_type: 1=most_recent, 3=trending
+  const queryType = sort === 'mostrecent' ? 1 : 3
+  const url = `https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/` +
+    `?appid=431960&query_type=${queryType}&numperpage=30&page=${page - 1}` +
+    `&return_details=1&return_previews=1&return_tags=1&filetype=0`
+  const raw = await httpGet(url)
+  const data = JSON.parse(raw)
+  if (data?.response?.result && data.response.result !== 1) throw new Error('API result ' + data.response.result)
+  return parseWorkshopItems(data?.response?.publishedfiledetails ?? [])
+}
+
+// Fallback: scrape steamcommunity.com HTML then call GetPublishedFileDetails
+// Requires steamcommunity.com to be reachable (blocked in mainland China).
+async function browseViaHTML(sort: string, page: number): Promise<OnlineWorkshopItem[]> {
+  const url = `https://steamcommunity.com/workshop/browse/?appid=431960&browsesort=${sort}&section=readytousefiles&numperpage=30&p=${page}`
+  const html = await httpGet(url)
+  const ids: string[] = []
+  const re = /filedetails\/\?id=(\d+)/g
+  let m
+  while ((m = re.exec(html)) !== null) {
+    if (!ids.includes(m[1])) ids.push(m[1])
+  }
+  if (!ids.length) return []
+  const body = ['itemcount=' + ids.length, ...ids.map((id, i) => `publishedfileids[${i}]=${id}`)].join('&')
+  const raw = await httpPost('https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/', body)
+  return parseWorkshopItems(JSON.parse(raw)?.response?.publishedfiledetails ?? [])
+}
+
+export async function browseOnlineWorkshop(sort: string, page: number): Promise<OnlineWorkshopItem[]> {
+  try {
+    return await browseViaAPI(sort, page)
+  } catch (e) {
+    console.warn('[wallpaperEngine] QueryFiles API failed, falling back to HTML scrape:', e)
+    return browseViaHTML(sort, page)
+  }
+}
 
 // ── Built-in theme HTML ──────────────────────────────────────────────────────
 
@@ -136,6 +270,337 @@ function draw(){
 draw()
 </script></body></html>`
 
+// Fragment shader in a separate <script> tag to avoid backtick nesting.
+// Uses animationType="3drotate": the prism tumbles in full 3-D space so each
+// face catches the light differently — matches the React Bits Prism demo.
+const THEME_PRISM = `<!DOCTYPE html><html><head>
+<style>*{margin:0;padding:0}body{background:#000;overflow:hidden}canvas{position:absolute;inset:0;width:100%;height:100%;display:block}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2  iResolution;
+uniform float iTime;
+uniform float uHeight;
+uniform float uBaseHalf;
+uniform mat3  uRot;
+uniform int   uUseBaseWobble;
+uniform float uGlow;
+uniform vec2  uOffsetPx;
+uniform float uNoise;
+uniform float uSaturation;
+uniform float uColorFreq;
+uniform float uBloom;
+uniform float uCenterShift;
+uniform float uInvBaseHalf;
+uniform float uInvHeight;
+uniform float uMinAxis;
+uniform float uPxScale;
+uniform float uTimeScale;
+vec4 tanh4(vec4 x){vec4 e=exp(2.0*x);return(e-1.0)/(e+1.0);}
+float rand(vec2 c){return fract(sin(dot(c,vec2(12.9898,78.233)))*43758.5453);}
+float sdOctaAnisoInv(vec3 p){
+  vec3 q=vec3(abs(p.x)*uInvBaseHalf,abs(p.y)*uInvHeight,abs(p.z)*uInvBaseHalf);
+  return(q.x+q.y+q.z-1.0)*uMinAxis*0.5773502692;
+}
+float sdPyramidUpInv(vec3 p){return max(sdOctaAnisoInv(p),-p.y);}
+void main(){
+  vec2 f=(gl_FragCoord.xy-0.5*iResolution.xy-uOffsetPx)*uPxScale;
+  float z=5.0;vec4 o=vec4(0.0);vec3 p;
+  mat2 wob=mat2(1.0);
+  if(uUseBaseWobble==1){
+    float t=iTime*uTimeScale;
+    float c0=cos(t),c1=cos(t+33.0),c2=cos(t+11.0);
+    wob=mat2(c0,c1,c2,c0);
+  }
+  for(int i=0;i<100;i++){
+    p=vec3(f,z);p.xz=p.xz*wob;p=uRot*p;
+    vec3 q=p;q.y+=uCenterShift;
+    float d=0.1+0.2*abs(sdPyramidUpInv(q));
+    z-=d;
+    o+=(sin((p.y+z)*uColorFreq+vec4(0.0,1.0,2.0,3.0))+1.0)/d;
+  }
+  o=tanh4(o*o*(uGlow*uBloom)/1e5);
+  vec3 col=o.rgb+(rand(gl_FragCoord.xy+vec2(iTime))-0.5)*uNoise;
+  col=clamp(col,0.0,1.0);
+  float L=dot(col,vec3(0.2126,0.7152,0.0722));
+  col=clamp(mix(vec3(L),col,uSaturation),0.0,1.0);
+  gl_FragColor=vec4(col,1.0);
+}
+<\/script>
+<script>
+(function(){
+  var C=document.getElementById('c');
+  var gl=C.getContext('webgl',{alpha:false,antialias:false,depth:false,stencil:false});
+  if(!gl){document.body.style.background='#111';return;}
+  gl.disable(gl.DEPTH_TEST);gl.disable(gl.CULL_FACE);gl.disable(gl.BLEND);
+
+  var VS='attribute vec2 position;void main(){gl_Position=vec4(position,0.0,1.0);}';
+  var FS=document.getElementById('frag').textContent;
+
+  function sh(type,src){
+    var s=gl.createShader(type);
+    gl.shaderSource(s,src);gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  var prog=gl.createProgram();
+  gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));
+  gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));
+  gl.linkProgram(prog);gl.useProgram(prog);
+
+  var buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  var aPos=gl.getAttribLocation(prog,'position');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,0,0);
+
+  var names=['iResolution','iTime','uHeight','uBaseHalf','uRot','uUseBaseWobble',
+    'uGlow','uOffsetPx','uNoise','uSaturation','uColorFreq','uBloom',
+    'uCenterShift','uInvBaseHalf','uInvHeight','uMinAxis','uPxScale','uTimeScale'];
+  var U={};
+  names.forEach(function(n){U[n]=gl.getUniformLocation(prog,n);});
+
+  // Exact React Bits defaults (transparent=true → SAT=1.5)
+  var H=3.5,BW=5.5,BH=BW*0.5,GLOW=1.0,NOISE=0.5,SCALE=3.6,CFREQ=1.0,BLOOM=1.0,TS=0.5,SAT=1.5;
+
+  gl.uniform1f(U.uHeight,H);
+  gl.uniform1f(U.uBaseHalf,BH);
+  gl.uniform1i(U.uUseBaseWobble,0);
+  gl.uniform1f(U.uGlow,GLOW);
+  gl.uniform2f(U.uOffsetPx,0,0);
+  gl.uniform1f(U.uNoise,NOISE);
+  gl.uniform1f(U.uSaturation,SAT);
+  gl.uniform1f(U.uColorFreq,CFREQ);
+  gl.uniform1f(U.uBloom,BLOOM);
+  gl.uniform1f(U.uCenterShift,H*0.25);
+  gl.uniform1f(U.uInvBaseHalf,1/BH);
+  gl.uniform1f(U.uInvHeight,1/H);
+  gl.uniform1f(U.uMinAxis,Math.min(BH,H));
+  gl.uniform1f(U.uTimeScale,TS);
+
+  function resize(){
+    C.width=window.innerWidth;C.height=window.innerHeight;
+    gl.viewport(0,0,C.width,C.height);
+    gl.uniform2f(U.iResolution,C.width,C.height);
+    gl.uniform1f(U.uPxScale,1/(C.height*0.1*SCALE));
+  }
+  window.addEventListener('resize',resize);resize();
+
+  // 3drotate: randomise angular speeds and phase offsets each session
+  var wX=0.3+Math.random()*0.6;
+  var wY=0.2+Math.random()*0.7;
+  var wZ=0.1+Math.random()*0.5;
+  var phX=Math.random()*Math.PI*2;
+  var phZ=Math.random()*Math.PI*2;
+  var rotBuf=new Float32Array(9);
+
+  // Build YXZ Euler rotation matrix in column-major order for WebGL
+  function setMat3FromEuler(yY,pX,rZ,out){
+    var cy=Math.cos(yY),sy=Math.sin(yY);
+    var cx=Math.cos(pX),sx=Math.sin(pX);
+    var cz=Math.cos(rZ),sz=Math.sin(rZ);
+    out[0]=cy*cz+sy*sx*sz; out[1]=cx*sz;            out[2]=-sy*cz+cy*sx*sz;
+    out[3]=-cy*sz+sy*sx*cz;out[4]=cx*cz;             out[5]=sy*sz+cy*sx*cz;
+    out[6]=sy*cx;           out[7]=-sx;               out[8]=cy*cx;
+    return out;
+  }
+
+  var t0=performance.now();
+  function frame(){
+    var time=(performance.now()-t0)*0.001;
+    var ts=time*TS;
+    var yaw=ts*wY;
+    var pitch=Math.sin(ts*wX+phX)*0.6;
+    var roll=Math.sin(ts*wZ+phZ)*0.5;
+    gl.uniformMatrix3fv(U.uRot,false,setMat3FromEuler(yaw,pitch,roll,rotBuf));
+    gl.uniform1f(U.iTime,time);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+<\/script>
+</body></html>`
+
+// DarkVeil: CPPN-based organic neural-network background (React Bits).
+// Shader weights are baked in; no npm dependency needed.
+const THEME_DARKVEIL = `<!DOCTYPE html><html><head>
+<style>*{margin:0;padding:0}body{background:#000;overflow:hidden}canvas{position:absolute;inset:0;width:100%;height:100%;display:block}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2 uResolution;
+uniform float uTime;
+uniform float uHueShift;
+uniform float uNoise;
+uniform float uScan;
+uniform float uScanFreq;
+uniform float uWarp;
+#define iTime uTime
+#define iResolution uResolution
+vec4 buf[8];
+float rand(vec2 c){return fract(sin(dot(c,vec2(12.9898,78.233)))*43758.5453);}
+mat3 rgb2yiq=mat3(0.299,0.587,0.114,0.596,-0.274,-0.322,0.211,-0.523,0.312);
+mat3 yiq2rgb=mat3(1.0,0.956,0.621,1.0,-0.272,-0.647,1.0,-1.106,1.703);
+vec3 hueShiftRGB(vec3 col,float deg){
+  vec3 yiq=rgb2yiq*col;
+  float rad=radians(deg);float ch=cos(rad),sh=sin(rad);
+  return clamp(yiq2rgb*vec3(yiq.x,yiq.y*ch-yiq.z*sh,yiq.y*sh+yiq.z*ch),0.0,1.0);
+}
+vec4 sigmoid(vec4 x){return 1./(1.+exp(-x));}
+vec4 cppn_fn(vec2 co,float in0,float in1,float in2){
+  buf[6]=vec4(co.x,co.y,0.3948333106474662+in0,0.36+in1);
+  buf[7]=vec4(0.14+in2,sqrt(co.x*co.x+co.y*co.y),0.,0.);
+  buf[0]=mat4(vec4(6.5404263,-3.6126034,0.7590882,-1.13613),vec4(2.4582713,3.1660357,1.2219609,0.06276096),vec4(-5.478085,-6.159632,1.8701609,-4.7742867),vec4(6.039214,-5.542865,-0.90925294,3.251348))*buf[6]+mat4(vec4(0.8473259,-5.722911,3.975766,1.6522468),vec4(-0.24321538,0.5839259,-1.7661959,-5.350116),vec4(0.,0.,0.,0.),vec4(0.,0.,0.,0.))*buf[7]+vec4(0.21808943,1.1243913,-1.7969975,5.0294676);
+  buf[1]=mat4(vec4(-3.3522482,-6.0612736,0.55641043,-4.4719114),vec4(0.8631464,1.7432913,5.643898,1.6106541),vec4(2.4941394,-3.5012043,1.7184316,6.357333),vec4(3.310376,8.209261,1.1355612,-1.165539))*buf[6]+mat4(vec4(5.24046,-13.034365,0.009859298,15.870829),vec4(2.987511,3.129433,-0.89023495,-1.6822904),vec4(0.,0.,0.,0.),vec4(0.,0.,0.,0.))*buf[7]+vec4(-5.9457836,-6.573602,-0.8812491,1.5436668);
+  buf[0]=sigmoid(buf[0]);buf[1]=sigmoid(buf[1]);
+  buf[2]=mat4(vec4(-15.219568,8.095543,-2.429353,-1.9381982),vec4(-5.951362,4.3115187,2.6393783,1.274315),vec4(-7.3145227,6.7297835,5.2473326,5.9411426),vec4(5.0796127,8.979051,-1.7278991,-1.158976))*buf[6]+mat4(vec4(-11.967154,-11.608155,6.1486754,11.237008),vec4(2.124141,-6.263192,-1.7050359,-0.7021966),vec4(0.,0.,0.,0.),vec4(0.,0.,0.,0.))*buf[7]+vec4(-4.17164,-3.2281182,-4.576417,-3.6401186);
+  buf[3]=mat4(vec4(3.1832156,-13.738922,1.879223,3.233465),vec4(0.64300746,12.768129,1.9141049,0.50990224),vec4(-0.049295485,4.4807224,1.4733979,1.801449),vec4(5.0039253,13.000481,3.3991797,-4.5561905))*buf[6]+mat4(vec4(-0.1285731,7.720628,-3.1425676,4.742367),vec4(0.6393625,3.714393,-0.8108378,-0.39174938),vec4(0.,0.,0.,0.),vec4(0.,0.,0.,0.))*buf[7]+vec4(-1.1811101,-21.621881,0.7851888,1.2329718);
+  buf[2]=sigmoid(buf[2]);buf[3]=sigmoid(buf[3]);
+  buf[4]=mat4(vec4(5.214916,-7.183024,2.7228765,2.6592617),vec4(-5.601878,-25.3591,4.067988,0.4602802),vec4(-10.57759,24.286327,21.102104,37.546658),vec4(4.3024497,-1.9625226,2.3458803,-1.372816))*buf[0]+mat4(vec4(-17.6526,-10.507558,2.2587414,12.462782),vec4(6.265566,-502.75443,-12.642513,0.9112289),vec4(-10.983244,20.741234,-9.701768,-0.7635988),vec4(5.383626,1.4819539,-4.1911616,-4.8444734))*buf[1]+mat4(vec4(12.785233,-16.345072,-0.39901125,1.7955981),vec4(-30.48365,-1.8345358,1.4542528,-1.1118771),vec4(19.872723,-7.337935,-42.941723,-98.52709),vec4(8.337645,-2.7312303,-2.2927687,-36.142323))*buf[2]+mat4(vec4(-16.298317,3.5471997,-0.44300047,-9.444417),vec4(57.5077,-35.609753,16.163465,-4.1534753),vec4(-0.07470326,-3.8656476,-7.0901804,3.1523974),vec4(-12.559385,-7.077619,1.490437,-0.8211543))*buf[3]+vec4(-7.67914,15.927437,1.3207729,-1.6686112);
+  buf[5]=mat4(vec4(-1.4109162,-0.372762,-3.770383,-21.367174),vec4(-6.2103205,-9.35908,0.92529047,8.82561),vec4(11.460242,-22.348068,13.625772,-18.693201),vec4(-0.3429052,-3.9905605,-2.4626114,-0.45033523))*buf[0]+mat4(vec4(7.3481627,-4.3661838,-6.3037653,-3.868115),vec4(1.5462853,6.5488915,1.9701879,-0.58291394),vec4(6.5858274,-2.2180402,3.7127688,-1.3730392),vec4(-5.7973905,10.134961,-2.3395722,-5.965605))*buf[1]+mat4(vec4(-2.5132585,-6.6685553,-1.4029363,-0.16285264),vec4(-0.37908727,0.53738135,4.389061,-1.3024765),vec4(-0.70647055,2.0111287,-5.1659346,-3.728635),vec4(-13.562562,10.487719,-0.9173751,-2.6487076))*buf[2]+mat4(vec4(-8.645013,6.5546675,-6.3944063,-5.5933375),vec4(-0.57783127,-1.077275,36.91025,5.736769),vec4(14.283112,3.7146652,7.1452246,-4.5958776),vec4(2.7192075,3.6021907,-4.366337,-2.3653464))*buf[3]+vec4(-5.9000807,-4.329569,1.2427121,8.59503);
+  buf[4]=sigmoid(buf[4]);buf[5]=sigmoid(buf[5]);
+  buf[6]=mat4(vec4(-1.61102,0.7970257,1.4675229,0.20917463),vec4(-28.793737,-7.1390953,1.5025433,4.656581),vec4(-10.94861,39.66238,0.74318546,-10.095605),vec4(-0.7229728,-1.5483948,0.7301322,2.1687684))*buf[0]+mat4(vec4(3.2547753,21.489103,-1.0194173,-3.3100595),vec4(-3.7316632,-3.3792162,-7.223193,-0.23685838),vec4(13.1804495,0.7916005,5.338587,5.687114),vec4(-4.167605,-17.798311,-6.815736,-1.6451967))*buf[1]+mat4(vec4(0.604885,-7.800309,-7.213122,-2.741014),vec4(-3.522382,-0.12359311,-0.5258442,0.43852118),vec4(9.6752825,-22.853785,2.062431,0.099892326),vec4(-4.3196306,-17.730087,2.5184598,5.30267))*buf[2]+mat4(vec4(-6.545563,-15.790176,-6.0438633,-5.415399),vec4(-43.591583,28.551912,-16.00161,18.84728),vec4(4.212382,8.394307,3.0958717,8.657522),vec4(-5.0237565,-4.450633,-4.4768,-5.5010443))*buf[3]+mat4(vec4(1.6985557,-67.05806,6.897715,1.9004834),vec4(1.8680354,2.3915145,2.5231109,4.081538),vec4(11.158006,1.7294737,2.0738268,7.386411),vec4(-4.256034,-306.24686,8.258898,-17.132736))*buf[4]+mat4(vec4(1.6889864,-4.5852966,3.8534803,-6.3482175),vec4(1.3543309,-1.2640043,9.932754,2.9079645),vec4(-5.2770967,0.07150358,-0.13962056,3.3269649),vec4(28.34703,-4.918278,6.1044083,4.085355))*buf[5]+vec4(6.6818056,12.522166,-3.7075126,-4.104386);
+  buf[7]=mat4(vec4(-8.265602,-4.7027016,5.098234,0.7509808),vec4(8.6507845,-17.15949,16.51939,-8.884479),vec4(-4.036479,-2.3946867,-2.6055532,-1.9866527),vec4(-2.2167742,-1.8135649,-5.9759874,4.8846445))*buf[0]+mat4(vec4(6.7790847,3.5076547,-2.8191125,-2.7028968),vec4(-5.743024,-0.27844876,1.4958696,-5.0517144),vec4(13.122226,15.735168,-2.9397483,-4.101023),vec4(-14.375265,-5.030483,-6.2599335,2.9848232))*buf[1]+mat4(vec4(4.0950394,-0.94011575,-5.674733,4.755022),vec4(4.3809423,4.8310084,1.7425908,-3.437416),vec4(2.117492,0.16342592,-104.56341,16.949184),vec4(-5.22543,-2.994248,3.8350096,-1.9364246))*buf[2]+mat4(vec4(-5.900337,1.7946124,-13.604192,-3.8060522),vec4(6.6583457,31.911177,25.164474,91.81147),vec4(11.840538,4.1503043,-0.7314397,6.768467),vec4(-6.3967767,4.034772,6.1714606,-0.32874924))*buf[3]+mat4(vec4(3.4992442,-196.91893,-8.923708,2.8142626),vec4(3.4806502,-3.1846354,5.1725626,5.1804223),vec4(-2.4009497,15.585794,1.2863957,2.0252278),vec4(-71.25271,-62.441242,-8.138444,0.50670296))*buf[4]+mat4(vec4(-12.291733,-11.176166,-7.3474145,4.390294),vec4(10.805477,5.6337385,-0.9385842,-4.7348723),vec4(-12.869276,-7.039391,5.3029537,7.5436664),vec4(1.4593618,8.91898,3.5101583,5.840625))*buf[5]+vec4(2.2415268,-6.705987,-0.98861027,-2.117676);
+  buf[6]=sigmoid(buf[6]);buf[7]=sigmoid(buf[7]);
+  buf[0]=mat4(vec4(1.6794263,1.3817469,2.9625452,0.),vec4(-1.8834411,-1.4806935,-3.5924516,0.),vec4(-1.3279216,-1.0918057,-2.3124623,0.),vec4(0.2662234,0.23235129,0.44178495,0.))*buf[0]+mat4(vec4(-0.6299101,-0.5945583,-0.9125601,0.),vec4(0.17828953,0.18300213,0.18182953,0.),vec4(-2.96544,-2.5819945,-4.9001055,0.),vec4(1.4195864,1.1868085,2.5176322,0.))*buf[1]+mat4(vec4(-1.2584374,-1.0552157,-2.1688404,0.),vec4(-0.7200217,-0.52666044,-1.438251,0.),vec4(0.15345335,0.15196142,0.272854,0.),vec4(0.945728,0.8861938,1.2766753,0.))*buf[2]+mat4(vec4(-2.4218085,-1.968602,-4.35166,0.),vec4(-22.683098,-18.0544,-41.954372,0.),vec4(0.63792,0.5470648,1.1078634,0.),vec4(-1.5489894,-1.3075932,-2.6444845,0.))*buf[3]+mat4(vec4(-0.49252132,-0.39877754,-0.91366625,0.),vec4(0.95609266,0.7923952,1.640221,0.),vec4(0.30616966,0.15693925,0.8639857,0.),vec4(1.1825981,0.94504964,2.176963,0.))*buf[4]+mat4(vec4(0.35446745,0.3293795,0.59547555,0.),vec4(-0.58784515,-0.48177817,-1.0614829,0.),vec4(2.5271258,1.9991658,4.6846647,0.),vec4(0.13042648,0.08864098,0.30187556,0.))*buf[5]+mat4(vec4(-1.7718065,-1.4033192,-3.3355875,0.),vec4(3.1664357,2.638297,5.378702,0.),vec4(-3.1724713,-2.6107926,-5.549295,0.),vec4(-2.851368,-2.249092,-5.3013067,0.))*buf[6]+mat4(vec4(1.5203838,1.2212278,2.8404984,0.),vec4(1.5210563,1.2651345,2.683903,0.),vec4(2.9789467,2.4364579,5.2347264,0.),vec4(2.2270417,1.8825914,3.8028636,0.))*buf[7]+vec4(-1.5468478,-3.6171484,0.24762098,0.);
+  buf[0]=sigmoid(buf[0]);
+  return vec4(buf[0].x,buf[0].y,buf[0].z,1.);
+}
+void mainImage(out vec4 fragColor,in vec2 fragCoord){
+  vec2 uv=fragCoord/iResolution.xy*2.-1.;
+  uv.y*=-1.;
+  uv+=uWarp*vec2(sin(uv.y*6.2832+iTime*0.5),cos(uv.x*6.2832+iTime*0.5))*0.05;
+  fragColor=cppn_fn(uv,0.1*sin(0.3*iTime),0.1*sin(0.69*iTime),0.1*sin(0.44*iTime));
+}
+void main(){
+  vec4 col;mainImage(col,gl_FragCoord.xy);
+  col.rgb=hueShiftRGB(col.rgb,uHueShift);
+  float sv=sin(gl_FragCoord.y*uScanFreq)*0.5+0.5;
+  col.rgb*=1.-(sv*sv)*uScan;
+  col.rgb+=(rand(gl_FragCoord.xy+uTime)-0.5)*uNoise;
+  gl_FragColor=vec4(clamp(col.rgb,0.0,1.0),1.0);
+}
+<\/script>
+<script>
+(function(){
+  var C=document.getElementById('c');
+  var gl=C.getContext('webgl',{alpha:false,antialias:false,depth:false,stencil:false});
+  if(!gl){document.body.style.background='#111';return;}
+  gl.disable(gl.DEPTH_TEST);gl.disable(gl.CULL_FACE);gl.disable(gl.BLEND);
+  var VS='attribute vec2 position;void main(){gl_Position=vec4(position,0.0,1.0);}';
+  var FS=document.getElementById('frag').textContent;
+  function sh(type,src){var s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));return s;}
+  var prog=gl.createProgram();
+  gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));
+  gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));
+  gl.linkProgram(prog);gl.useProgram(prog);
+  var buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  var aPos=gl.getAttribLocation(prog,'position');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,0,0);
+  var uRes=gl.getUniformLocation(prog,'uResolution');
+  var uTime=gl.getUniformLocation(prog,'uTime');
+  gl.uniform1f(gl.getUniformLocation(prog,'uHueShift'),0.0);
+  gl.uniform1f(gl.getUniformLocation(prog,'uNoise'),0.015);
+  gl.uniform1f(gl.getUniformLocation(prog,'uScan'),0.0);
+  gl.uniform1f(gl.getUniformLocation(prog,'uScanFreq'),80.0);
+  gl.uniform1f(gl.getUniformLocation(prog,'uWarp'),0.5);
+  function resize(){C.width=window.innerWidth;C.height=window.innerHeight;gl.viewport(0,0,C.width,C.height);gl.uniform2f(uRes,C.width,C.height);}
+  window.addEventListener('resize',resize);resize();
+  var t0=performance.now(),SPEED=0.5;
+  function frame(){gl.uniform1f(uTime,(performance.now()-t0)*0.001*SPEED);gl.drawArrays(gl.TRIANGLES,0,3);requestAnimationFrame(frame);}
+  requestAnimationFrame(frame);
+})();
+<\/script>
+</body></html>`
+
+// FloatingLines: three-layer undulating coloured wave lines (React Bits).
+// Rewritten as pure WebGL: loop bounds are #define constants (GLSL ES 1.0 compatible).
+const THEME_FLOATINGLINES = `<!DOCTYPE html><html><head>
+<style>*{margin:0;padding:0}body{background:#000;overflow:hidden}canvas{position:absolute;inset:0;width:100%;height:100%;display:block}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2  uResolution;
+uniform float uTime;
+#define BOT_N  8
+#define MID_N 14
+#define TOP_N  8
+mat2 rot(float r){return mat2(cos(r),sin(r),-sin(r),cos(r));}
+vec3 grad(float t){
+  vec3 a=vec3(0.482,0.184,1.0);
+  vec3 b=vec3(1.0,0.431,0.776);
+  vec3 c=vec3(0.118,0.937,1.0);
+  t=clamp(t,0.0,1.0);
+  if(t<0.5)return mix(a,b,t*2.0);
+  return mix(b,c,(t-0.5)*2.0);
+}
+float wave(vec2 uv,float off){
+  float amp=sin(off+uTime*0.2)*0.3;
+  float y=sin(uv.x+off+uTime*0.1)*amp;
+  float m=uv.y-y;
+  return 0.0175/max(abs(m)+0.01,1e-3)+0.01;
+}
+void main(){
+  vec2 uv=(2.0*gl_FragCoord.xy-uResolution)/uResolution.y;
+  uv.y*=-1.0;
+  vec3 col=vec3(0.0);
+  for(int i=0;i<BOT_N;i++){
+    float fi=float(i),t=fi/float(BOT_N-1);
+    vec2 r=uv*rot(-1.0*log(length(uv)+1.0));
+    col+=grad(t)*wave(r+vec2(0.045*fi+2.0,-0.7),1.5+0.2*fi)*0.18;
+  }
+  for(int i=0;i<MID_N;i++){
+    float fi=float(i),t=fi/float(MID_N-1);
+    vec2 r=uv*rot(0.2*log(length(uv)+1.0));
+    col+=grad(t)*wave(r+vec2(0.055*fi+5.0,0.0),2.0+0.15*fi)*0.75;
+  }
+  for(int i=0;i<TOP_N;i++){
+    float fi=float(i),t=fi/float(TOP_N-1);
+    vec2 r=uv*rot(-0.4*log(length(uv)+1.0));
+    r.x*=-1.0;
+    col+=grad(t)*wave(r+vec2(0.07*fi+10.0,0.5),1.0+0.2*fi)*0.09;
+  }
+  gl_FragColor=vec4(col,1.0);
+}
+<\/script>
+<script>
+(function(){
+  var C=document.getElementById('c');
+  var gl=C.getContext('webgl',{alpha:false,antialias:false,depth:false,stencil:false});
+  if(!gl){document.body.style.background='#111';return;}
+  gl.disable(gl.DEPTH_TEST);gl.disable(gl.CULL_FACE);gl.disable(gl.BLEND);
+  var VS='attribute vec2 position;void main(){gl_Position=vec4(position,0.0,1.0);}';
+  var FS=document.getElementById('frag').textContent;
+  function sh(type,src){var s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));return s;}
+  var prog=gl.createProgram();
+  gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));
+  gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));
+  gl.linkProgram(prog);gl.useProgram(prog);
+  var buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  var aPos=gl.getAttribLocation(prog,'position');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos,2,gl.FLOAT,false,0,0);
+  var uRes=gl.getUniformLocation(prog,'uResolution');
+  var uTime=gl.getUniformLocation(prog,'uTime');
+  function resize(){C.width=window.innerWidth;C.height=window.innerHeight;gl.viewport(0,0,C.width,C.height);gl.uniform2f(uRes,C.width,C.height);}
+  window.addEventListener('resize',resize);resize();
+  var t0=performance.now(),SPEED=0.8;
+  function frame(){gl.uniform1f(uTime,(performance.now()-t0)*0.001*SPEED);gl.drawArrays(gl.TRIANGLES,0,3);requestAnimationFrame(frame);}
+  requestAnimationFrame(frame);
+})();
+<\/script>
+</body></html>`
+
 // ── Theme catalog ────────────────────────────────────────────────────────────
 
 export interface WallpaperTheme {
@@ -146,11 +611,14 @@ export interface WallpaperTheme {
 }
 
 export const THEMES: WallpaperTheme[] = [
-  { id: 'matrix',    name: '数字雨',   desc: '经典黑客风格绿色矩阵',   colors: ['#000','#001a00','#00ff41'] },
-  { id: 'particles', name: '粒子网络', desc: '浮动粒子连线构成的星云',   colors: ['#0a0f1e','#1d4ed8','#7dd3fc'] },
-  { id: 'aurora',    name: '极光',     desc: '流动的北极光彩带',        colors: ['#000','#064e3b','#7c4dff','#e040fb'] },
-  { id: 'stars',     name: '星际穿越', desc: '深空高速穿越星场',        colors: ['#000','#0a0a1a','#6060ff'] },
-  { id: 'geometric', name: '几何流',   desc: '漂浮变换的几何形体',      colors: ['#0a0010','#7c3aed','#f59e0b'] },
+  { id: 'matrix',    name: '数字雨',   desc: '经典黑客风格绿色矩阵',      colors: ['#000','#001a00','#00ff41'] },
+  { id: 'particles', name: '粒子网络', desc: '浮动粒子连线构成的星云',      colors: ['#0a0f1e','#1d4ed8','#7dd3fc'] },
+  { id: 'aurora',    name: '极光',     desc: '流动的北极光彩带',           colors: ['#000','#064e3b','#7c4dff','#e040fb'] },
+  { id: 'stars',     name: '星际穿越', desc: '深空高速穿越星场',           colors: ['#000','#0a0a1a','#6060ff'] },
+  { id: 'geometric', name: '几何流',   desc: '漂浮变换的几何形体',         colors: ['#0a0010','#7c3aed','#f59e0b'] },
+  { id: 'prism',        name: '棱镜',   desc: '七彩光棱镜 WebGL 折射效果',      colors: ['#000014','#5500ff','#ff0066','#00ffcc'] },
+  { id: 'darkveil',     name: '暗纱',   desc: 'CPPN 神经网络生成有机暗色动态纹理', colors: ['#000010','#1a0033','#cc44aa','#0077cc'] },
+  { id: 'floatinglines',name: '流光线', desc: '三层紫粉青彩色流动曲线叠加',       colors: ['#000013','#7b2fff','#ff6ec7','#00eeff'] },
 ]
 
 const THEME_HTML: Record<string, string> = {
@@ -159,6 +627,9 @@ const THEME_HTML: Record<string, string> = {
   aurora:    THEME_AURORA,
   stars:     THEME_STARS,
   geometric: THEME_GEOMETRIC,
+  prism:         THEME_PRISM,
+  darkveil:      THEME_DARKVEIL,
+  floatinglines: THEME_FLOATINGLINES,
 }
 
 // ── Storage helpers ──────────────────────────────────────────────────────────
@@ -173,7 +644,8 @@ function seedThemes(): void {
   const dir = getThemeDir()
   for (const [id, html] of Object.entries(THEME_HTML)) {
     const p = path.join(dir, `${id}.html`)
-    if (!fs.existsSync(p)) fs.writeFileSync(p, html, 'utf8')
+    // Always overwrite 'prism' so parameter updates take effect immediately
+    if (id === 'prism' || !fs.existsSync(p)) fs.writeFileSync(p, html, 'utf8')
   }
 }
 
@@ -181,7 +653,7 @@ function getConfigPath(): string { return path.join(getDataBase(), 'wallpaper-en
 
 interface EngineConfig {
   enabled: boolean
-  source?: { type: 'theme' | 'video'; id: string; path?: string }
+  source?: { type: 'theme' | 'video' | 'web' | 'scene'; id: string; path?: string }
   volume:  number
 }
 
@@ -306,6 +778,7 @@ let win:         BrowserWindow | null = null
 let paused       = false
 let embedded     = false
 let loadHandler: (() => Promise<void>) | null = null
+let externalEngineActive = false
 
 function buildVideoPage(filePath: string, volume: number): string {
   // Use forward slashes and proper file:// URL
@@ -347,17 +820,37 @@ async function createWindow(): Promise<BrowserWindow> {
 async function startEngine(cfg: EngineConfig): Promise<void> {
   if (!cfg.source) return
 
+  const { source } = cfg
+
+  // Scene wallpapers use Wallpaper Engine's proprietary renderer. Its official
+  // CLI accepts project.json, so scene.pkg never needs to be unpacked here.
+  if (source.type === 'scene') {
+    if (!source.path || !fs.existsSync(source.path)) throw new Error('场景壁纸文件不存在')
+    destroyInternalEngine()
+    await runWallpaperEngineControl(['openWallpaper', '-file', source.path])
+    externalEngineActive = true
+    paused = false
+    return
+  }
+
+  if (externalEngineActive) {
+    await runWallpaperEngineControl(['stop']).catch(() => {})
+    externalEngineActive = false
+  }
+
   const needEmbed = !win || win.isDestroyed()
   if (needEmbed) {
     win = await createWindow()
     embedded = false
   }
 
-  const { source } = cfg
-
   if (source.type === 'theme') {
     const htmlPath = path.join(getThemeDir(), `${source.id}.html`)
     win.loadFile(htmlPath)
+  } else if (source.type === 'web') {
+    // Wallpaper Engine web-type: load the HTML file directly from its own directory
+    if (!source.path || !fs.existsSync(source.path)) return
+    win.loadFile(source.path)
   } else {
     if (!source.path || !fs.existsSync(source.path)) return
     const tmpHtml = path.join(getDataBase(), '_wallpaper-video.html')
@@ -397,7 +890,7 @@ async function startEngine(cfg: EngineConfig): Promise<void> {
   paused = false
 }
 
-function stopEngine(): void {
+function destroyInternalEngine(): void {
   if (win && !win.isDestroyed()) {
     if (loadHandler) { win.webContents.removeListener('did-finish-load', loadHandler) }
     win.destroy()
@@ -408,9 +901,177 @@ function stopEngine(): void {
   loadHandler = null
 }
 
+async function stopEngine(): Promise<void> {
+  destroyInternalEngine()
+  if (externalEngineActive) {
+    await runWallpaperEngineControl(['stop']).catch(() => {})
+    externalEngineActive = false
+  }
+}
+
 async function execInWin(js: string): Promise<void> {
   if (!win || win.isDestroyed()) return
   try { await win.webContents.executeJavaScript(js) } catch {}
+}
+
+// ── Steam Workshop scanner ────────────────────────────────────────────────────
+
+export interface WorkshopItem {
+  id:          string
+  title:       string
+  type:        'video' | 'web' | 'scene'
+  file:        string   // video/html path, or project.json for scene wallpapers
+  preview:     string   // local-img:// URL (may be empty)
+  tags:        string[]
+  description: string
+}
+
+export interface WorkshopScanResult {
+  directory: string
+  sceneSupport: boolean
+  items: WorkshopItem[]
+}
+
+const WE_APP_ID = '431960'
+
+function execFileText(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { windowsHide: true }, (err, stdout) => err ? reject(err) : resolve(stdout))
+  })
+}
+
+async function readRegistryPath(key: string, value: string): Promise<string | null> {
+  try {
+    const stdout = await execFileText('reg', ['query', key, '/v', value])
+    const match = stdout.match(new RegExp(`${value}\\s+REG_SZ\\s+(.+)`, 'i'))
+    return match?.[1]?.trim() ?? null
+  } catch { return null }
+}
+
+// Steam may live in a custom folder and Workshop content may live in another
+// library. Read both registry locations and every libraryfolders.vdf we find.
+async function getSteamLibraries(): Promise<string[]> {
+  const candidates: string[] = [
+    'C:\\Program Files (x86)\\Steam',
+    'C:\\Program Files\\Steam',
+    'D:\\Steam',
+    'E:\\Steam',
+    'F:\\Steam',
+  ]
+
+  const registryPaths = await Promise.all([
+    readRegistryPath('HKCU\\Software\\Valve\\Steam', 'SteamPath'),
+    readRegistryPath('HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam', 'InstallPath'),
+  ])
+  for (const p of registryPaths) if (p) candidates.unshift(p)
+
+  const libraries = new Set<string>()
+  for (const base of candidates) {
+    if (!fs.existsSync(base)) continue
+    libraries.add(path.resolve(base))
+    const vdf = path.join(base, 'steamapps', 'libraryfolders.vdf')
+    if (!fs.existsSync(vdf)) continue
+    try {
+      const content = fs.readFileSync(vdf, 'utf8')
+      for (const match of content.matchAll(/"path"\s+"([^"]+)"/g)) {
+        libraries.add(path.resolve(match[1].replace(/\\\\/g, '\\')))
+      }
+    } catch {}
+  }
+  return [...libraries]
+}
+
+async function findWorkshopDir(): Promise<string | null> {
+  for (const library of await getSteamLibraries()) {
+    const dir = path.join(library, 'steamapps', 'workshop', 'content', WE_APP_ID)
+    if (fs.existsSync(dir)) return dir
+  }
+  return null
+}
+
+async function findWallpaperEngineExecutable(): Promise<string | null> {
+  for (const library of await getSteamLibraries()) {
+    const dir = path.join(library, 'steamapps', 'common', 'wallpaper_engine')
+    for (const exe of ['wallpaper64.exe', 'wallpaper32.exe']) {
+      const candidate = path.join(dir, exe)
+      if (fs.existsSync(candidate)) return candidate
+    }
+  }
+  return null
+}
+
+async function runWallpaperEngineControl(args: string[]): Promise<void> {
+  const executable = await findWallpaperEngineExecutable()
+  if (!executable) throw new Error('未找到 Wallpaper Engine，请先在 Steam 中安装或启动它')
+  await execFileText(executable, ['-control', ...args])
+}
+
+function safeItemPath(itemDir: string, relativePath: string): string | null {
+  const resolved = path.resolve(itemDir, relativePath)
+  const prefix = path.resolve(itemDir) + path.sep
+  return resolved.startsWith(prefix) && fs.existsSync(resolved) ? resolved : null
+}
+
+export async function scanWorkshopItems(): Promise<WorkshopScanResult> {
+  const workshopDir = await findWorkshopDir()
+  const sceneSupport = !!(await findWallpaperEngineExecutable())
+  if (!workshopDir) return { directory: '', sceneSupport, items: [] }
+
+  if (!fs.existsSync(workshopDir)) return { directory: '', sceneSupport, items: [] }
+
+  const items: WorkshopItem[] = []
+
+  let entries: fs.Dirent[]
+  try { entries = fs.readdirSync(workshopDir, { withFileTypes: true }) }
+  catch { return { directory: workshopDir, sceneSupport, items: [] } }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const itemDir = path.join(workshopDir, entry.name)
+    const projFile = path.join(itemDir, 'project.json')
+    if (!fs.existsSync(projFile)) continue
+
+    try {
+      const proj = JSON.parse(fs.readFileSync(projFile, 'utf8'))
+      const type = (proj.type ?? '').toLowerCase()
+      if (type !== 'video' && type !== 'web' && type !== 'scene') continue
+
+      // Resolve main file
+      const fileName = type === 'scene'
+        ? 'project.json'
+        : (proj.file ?? (type === 'video' ? 'video.mp4' : 'index.html'))
+      const file = safeItemPath(itemDir, String(fileName))
+      if (!file) continue
+
+      // Resolve preview image
+      let preview = ''
+      const previewNames = [proj.preview, 'preview.gif', 'preview.png', 'preview.jpg', 'preview.jpeg']
+        .filter((name): name is string => typeof name === 'string' && name.length > 0)
+      for (const name of previewNames) {
+        const p = safeItemPath(itemDir, name)
+        if (p) {
+          preview = `local-img://local?p=${encodeURIComponent(p.replace(/\\/g, '/'))}`
+          break
+        }
+      }
+
+      items.push({
+        id:          entry.name,
+        title:       proj.title ?? entry.name,
+        type:        type as WorkshopItem['type'],
+        file,
+        preview,
+        tags:        Array.isArray(proj.tags) ? proj.tags : [],
+        description: proj.description ?? '',
+      })
+    } catch {}
+  }
+
+  return {
+    directory: workshopDir,
+    sceneSupport,
+    items: items.sort((a, b) => a.title.localeCompare(b.title, 'zh')),
+  }
 }
 
 // ── IPC ──────────────────────────────────────────────────────────────────────
@@ -434,22 +1095,30 @@ export function setupWallpaperEngineIPC(): void {
     const c = { ...loadConfig(), enabled }
     saveConfig(c)
     if (enabled && c.source) await startEngine(c)
-    else stopEngine()
+    else await stopEngine()
   })
 
   ipcMain.handle('wallpaper:setVolume', async (_e, volume: number) => {
     const c = { ...loadConfig(), volume }
     saveConfig(c)
-    await execInWin(`const v=document.querySelector('video');if(v){v.volume=${volume};v.muted=${volume === 0}}`)
+    if (c.source?.type === 'scene') {
+      await runWallpaperEngineControl([volume === 0 ? 'mute' : 'unmute'])
+    } else {
+      await execInWin(`const v=document.querySelector('video');if(v){v.volume=${volume};v.muted=${volume === 0}}`)
+    }
   })
 
   ipcMain.handle('wallpaper:setPaused', async (_e, p: boolean) => {
     paused = p
-    await execInWin(p ? 'document.querySelector("video")?.pause()' : 'document.querySelector("video")?.play()')
+    if (loadConfig().source?.type === 'scene') {
+      await runWallpaperEngineControl([p ? 'pause' : 'play'])
+    } else {
+      await execInWin(p ? 'document.querySelector("video")?.pause()' : 'document.querySelector("video")?.play()')
+    }
   })
 
   ipcMain.handle('wallpaper:getStatus', () => ({
-    active:  !!win && !win.isDestroyed(),
+    active:  externalEngineActive || (!!win && !win.isDestroyed()),
     paused,
     config:  loadConfig(),
   }))
@@ -464,6 +1133,14 @@ export function setupWallpaperEngineIPC(): void {
   })
 
   ipcMain.handle('wallpaper:stop', () => stopEngine())
+
+  ipcMain.handle('wallpaper:scanWorkshop', () => scanWorkshopItems())
+
+  ipcMain.handle('wallpaper:browseOnline', (_e, { sort = 'trend', page = 1 }: { sort?: string; page?: number } = {}) =>
+    browseOnlineWorkshop(sort, page)
+  )
+
+  ipcMain.handle('wallpaper:openExternal', (_e, url: string) => shell.openExternal(url))
 }
 
-export function shutdownWallpaperEngine(): void { stopEngine() }
+export function shutdownWallpaperEngine(): void { void stopEngine() }
