@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ListMusic, Plus, Pencil, Trash2, Play, ChevronRight } from 'lucide-react'
+import { ListMusic, Plus, Pencil, Trash2, Play } from 'lucide-react'
 import { usePlaylistStore, type Playlist } from '../store/playlist'
 import { usePlayerStore } from '../store/player'
 import TrackList from '../components/Music/TrackList'

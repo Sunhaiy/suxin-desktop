@@ -1,4 +1,4 @@
-import { app, BrowserWindow, session, protocol, net } from 'electron'
+import { app, BrowserWindow, session, protocol, net, powerMonitor } from 'electron'
 import { join } from 'path'
 import { networkInterfaces } from 'os'
 
@@ -20,7 +20,7 @@ import { setupTray } from './modules/tray'
 import { setupAutoLaunch } from './modules/autoLaunch'
 import { setupIPC } from './modules/ipc'
 import { setupMusicIPC } from './modules/music/index'
-import { initializeTracking, setupActivityIPC, flushAndStop } from './modules/activityTracker'
+import { initializeTracking, recordSystemEvent, setupActivityIPC, flushAndStop } from './modules/activityTracker'
 import { startNavServer, setupNavIPC } from './modules/navServer'
 import { setupWallpaperEngineIPC, shutdownWallpaperEngine } from './modules/wallpaperEngine'
 import { setupLocalWallpaperIPC } from './modules/localWallpaper'
@@ -161,6 +161,10 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   setupMusicIPC()
   setupActivityIPC()
   initializeTracking()
+  powerMonitor.on('suspend', () => recordSystemEvent('suspend'))
+  powerMonitor.on('resume', () => recordSystemEvent('resume'))
+  powerMonitor.on('lock-screen', () => recordSystemEvent('lock'))
+  powerMonitor.on('unlock-screen', () => recordSystemEvent('unlock'))
   setupNavIPC()
   startNavServer()
   setupWallpaperEngineIPC()

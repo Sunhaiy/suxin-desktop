@@ -2,12 +2,20 @@ import { useState, useEffect, useCallback } from 'react'
 import {
   ChevronLeft, ChevronRight, Activity, Circle, Trash2,
   Globe, Code2, Terminal, FolderOpen, MessageSquare, Mail,
-  Film, Gamepad2, FileText, Image, Music2,
+  Film, Gamepad2, FileText, Image, Music2, Search, Download,
+  LockKeyhole, Moon, Timer, Power, BarChart3,
 } from 'lucide-react'
 import { useToastStore } from '../store/toast'
 
 interface Session {
   app: string; title: string; start: number; end: number; url?: string
+  state?: 'active' | 'idle' | 'locked' | 'sleep'
+  pid?: number; processPath?: string; description?: string
+}
+
+interface SystemEvent {
+  type: 'startup' | 'shutdown' | 'suspend' | 'resume' | 'lock' | 'unlock'
+  time: number
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -99,6 +107,15 @@ const CATEGORY_ICON: Record<string, React.ElementType> = {
 
 function getCategory(app: string): string {
   return APP_CATEGORY[app.toLowerCase()] ?? ''
+}
+
+const CATEGORY_LABELS: Record<string, string> = {
+  browser: '浏览器', code: '开发', terminal: '终端', folder: '文件管理', chat: '沟通',
+  mail: '邮件', music: '音乐', video: '视频', game: '游戏', doc: '办公文档', image: '设计图像', other: '其他',
+}
+
+function isActiveSession(session: Session): boolean {
+  return !session.state || session.state === 'active'
 }
 
 function FaviconImg({ domain, size }: { domain: string; size: number }) {
@@ -309,11 +326,12 @@ function DayTimeline({ sessions, date }: { sessions: Session[]; date: Date }) {
         {sessions.map((s, i) => {
           const l     = Math.max(0, ((s.start - vStart) / span) * 100)
           const w     = Math.max(0.15, ((s.end - s.start) / span) * 100)
-          const label = s.url ? getDomain(s.url) || s.app : s.app
+          const label = isActiveSession(s) ? (s.url ? getDomain(s.url) || s.app : s.app) : s.title
+          const stateColor = s.state === 'idle' ? '#64748b' : s.state === 'locked' ? '#a855f7' : s.state === 'sleep' ? '#334155' : appColor(s.app)
           return (
             <div key={i} className="absolute inset-y-0 cursor-default transition-opacity hover:opacity-70"
               title={`${label}\n${s.title}\n${fmtTime(s.start)} – ${fmtTime(s.end)}  ${fmtDuration(s.end - s.start)}`}
-              style={{ left: `${l}%`, width: `${w}%`, background: appColor(s.app) }} />
+              style={{ left: `${l}%`, width: `${w}%`, background: stateColor }} />
           )
         })}
       </div>
@@ -323,7 +341,7 @@ function DayTimeline({ sessions, date }: { sessions: Session[]; date: Date }) {
 
 function AppStats({ sessions }: { sessions: Session[] }) {
   const map = new Map<string, number>()
-  for (const s of sessions) map.set(s.app, (map.get(s.app) ?? 0) + (s.end - s.start))
+  for (const s of sessions.filter(isActiveSession)) map.set(s.app, (map.get(s.app) ?? 0) + (s.end - s.start))
   const sorted = [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
   if (!sorted.length) return null
   const maxMs = sorted[0][1]
@@ -351,7 +369,7 @@ function AppStats({ sessions }: { sessions: Session[] }) {
 
 function SiteStats({ sessions }: { sessions: Session[] }) {
   const map = new Map<string, number>()
-  for (const s of sessions) {
+  for (const s of sessions.filter(isActiveSession)) {
     const domain = getDomain(s.url ?? '')
     if (!domain) continue
     map.set(domain, (map.get(domain) ?? 0) + (s.end - s.start))
@@ -381,16 +399,130 @@ function SiteStats({ sessions }: { sessions: Session[] }) {
   )
 }
 
+function SummaryCards({ sessions }: { sessions: Session[] }) {
+  const active = sessions.filter(isActiveSession)
+  const activeMs = active.reduce((sum, s) => sum + s.end - s.start, 0)
+  const idleMs = sessions.filter(s => s.state === 'idle').reduce((sum, s) => sum + s.end - s.start, 0)
+  const apps = new Set(active.map(s => s.app)).size
+  const longest = active.reduce((max, s) => Math.max(max, s.end - s.start), 0)
+  const first = active.length ? Math.min(...active.map(s => s.start)) : 0
+  const last = active.length ? Math.max(...active.map(s => s.end)) : 0
+  const switches = Array(24).fill(0) as number[]
+  active.slice(1).forEach(s => { switches[new Date(s.start).getHours()]++ })
+  const peakHour = Math.max(...switches) > 0 ? switches.indexOf(Math.max(...switches)) : -1
+  const values = [
+    { label: '有效使用', value: fmtDuration(activeMs), icon: Timer, color: '#14b8a6' },
+    { label: '空闲时间', value: fmtDuration(idleMs), icon: Moon, color: '#64748b' },
+    { label: '应用 / 切换', value: `${apps} / ${Math.max(0, active.length - 1)}`, icon: BarChart3, color: '#3b82f6' },
+    { label: '最长专注', value: fmtDuration(longest), icon: Activity, color: '#a855f7' },
+    { label: '首末活动', value: first ? `${fmtTime(first)}–${fmtTime(last)}` : '—', icon: Timer, color: '#f59e0b' },
+    { label: '切换高峰', value: peakHour >= 0 ? `${String(peakHour).padStart(2, '0')}:00 · ${switches[peakHour]}次` : '—', icon: BarChart3, color: '#ef4444' },
+  ]
+  return (
+    <div className="grid grid-cols-3 gap-2 px-4 pt-3">
+      {values.map(({ label, value, icon: Icon, color }) => (
+        <div key={label} className="rounded-lg bg-white/[0.035] px-3 py-2.5">
+          <div className="mb-1 flex items-center gap-1.5 text-[10px] text-secondary"><Icon size={11} style={{ color }} />{label}</div>
+          <p className="text-[14px] font-semibold tabular-nums text-secondaryDark">{value}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function HourlyChart({ sessions, date }: { sessions: Session[]; date: Date }) {
+  const dayStart = new Date(date).setHours(0, 0, 0, 0)
+  const buckets = Array.from({ length: 24 }, () => ({ active: 0, inactive: 0 }))
+  for (const session of sessions) {
+    for (let hour = 0; hour < 24; hour++) {
+      const start = dayStart + hour * 3_600_000
+      const overlap = Math.max(0, Math.min(session.end, start + 3_600_000) - Math.max(session.start, start))
+      if (isActiveSession(session)) buckets[hour].active += overlap
+      else buckets[hour].inactive += overlap
+    }
+  }
+  return (
+    <div className="px-4 pb-3">
+      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-secondary">每小时使用</p>
+      <div className="flex h-20 items-end gap-1 rounded-lg bg-white/[0.025] px-2 pt-2">
+        {buckets.map((bucket, hour) => {
+          const total = Math.min(3_600_000, bucket.active + bucket.inactive)
+          return (
+            <div key={hour} className="group relative flex h-full flex-1 flex-col justify-end" title={`${String(hour).padStart(2, '0')}:00 · 有效 ${fmtDuration(bucket.active)} · 非活动 ${fmtDuration(bucket.inactive)}`}>
+              <div className="w-full rounded-t-sm bg-accent/70" style={{ height: `${(bucket.active / 3_600_000) * 100}%` }} />
+              {total > bucket.active && <div className="w-full bg-slate-500/40" style={{ height: `${(bucket.inactive / 3_600_000) * 100}%` }} />}
+              {hour % 3 === 0 && <span className="absolute -bottom-4 left-1/2 -translate-x-1/2 text-[8px] text-secondary">{hour}</span>}
+            </div>
+          )
+        })}
+      </div>
+      <div className="h-4" />
+    </div>
+  )
+}
+
+function CategoryStats({ sessions }: { sessions: Session[] }) {
+  const map = new Map<string, number>()
+  for (const session of sessions.filter(isActiveSession)) {
+    const category = getCategory(session.app) || 'other'
+    map.set(category, (map.get(category) ?? 0) + session.end - session.start)
+  }
+  const sorted = [...map.entries()].sort((a, b) => b[1] - a[1])
+  const total = sorted.reduce((sum, [, ms]) => sum + ms, 0) || 1
+  if (!sorted.length) return null
+  return (
+    <div className="px-4 pb-3">
+      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-secondary">活动类别</p>
+      <div className="mb-2 flex h-2 overflow-hidden rounded-full bg-white/5">
+        {sorted.map(([category, ms], index) => <div key={category} style={{ width: `${ms / total * 100}%`, background: APP_PALETTE[index % APP_PALETTE.length] }} />)}
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        {sorted.map(([category, ms], index) => (
+          <span key={category} className="flex items-center gap-1 text-[10px] text-secondary">
+            <i className="h-1.5 w-1.5 rounded-full" style={{ background: APP_PALETTE[index % APP_PALETTE.length] }} />
+            {CATEGORY_LABELS[category]} {Math.round(ms / total * 100)}%
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+const EVENT_LABELS: Record<SystemEvent['type'], string> = {
+  startup: '软件启动', shutdown: '软件退出', suspend: '电脑休眠', resume: '电脑唤醒', lock: '屏幕锁定', unlock: '屏幕解锁',
+}
+
+function SystemEvents({ events }: { events: SystemEvent[] }) {
+  if (!events.length) return null
+  return (
+    <div className="px-4 pb-3">
+      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-secondary">系统节点</p>
+      <div className="flex flex-wrap gap-2">
+        {events.map((event, index) => (
+          <span key={`${event.time}-${index}`} className="flex items-center gap-1 rounded bg-white/[0.04] px-2 py-1 text-[10px] text-secondary">
+            {event.type === 'lock' || event.type === 'unlock' ? <LockKeyhole size={10} /> : event.type === 'suspend' || event.type === 'resume' ? <Moon size={10} /> : <Power size={10} />}
+            {fmtTime(event.time)} {EVENT_LABELS[event.type]}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function SessionRow({ s }: { s: Session }) {
   const domain = getDomain(s.url ?? '')
+  const inactive = !isActiveSession(s)
+  const StateIcon = s.state === 'locked' ? LockKeyhole : s.state === 'sleep' ? Moon : Timer
   return (
-    <div className="flex items-center gap-2.5 px-4 py-1.5 transition-colors hover:bg-white/3">
-      <AppIcon app={s.app} url={s.url} size={16} />
+    <div className="flex items-center gap-2.5 px-4 py-1.5 transition-colors hover:bg-white/3" title={s.processPath || s.description || ''}>
+      {inactive
+        ? <div className="flex h-4 w-4 items-center justify-center rounded bg-slate-500/15 text-slate-400"><StateIcon size={10} /></div>
+        : <AppIcon app={s.app} url={s.url} size={16} />}
       <div className="min-w-0 flex-1 flex items-baseline gap-1.5">
-        <span className="text-[12px] font-medium text-secondaryDark flex-shrink-0">{s.app}</span>
-        {domain
+        <span className="text-[12px] font-medium text-secondaryDark flex-shrink-0">{inactive ? s.title : (s.description || s.app)}</span>
+        {!inactive && domain
           ? <span className="text-[11px] text-accent/70 truncate">{domain}</span>
-          : s.title && s.title !== s.app
+          : !inactive && s.title && s.title !== s.app
             ? <span className="text-[11px] text-secondary truncate max-w-[200px]">{s.title}</span>
             : null}
       </div>
@@ -409,13 +541,17 @@ function SessionRow({ s }: { s: Session }) {
 export default function ActivityLog() {
   const [date,        setDate]        = useState(new Date())
   const [sessions,    setSessions]    = useState<Session[]>([])
+  const [events,      setEvents]      = useState<SystemEvent[]>([])
   const [tracking,    setTracking]    = useState(false)
   const [heatmapData, setHeatmapData] = useState<Record<string, number>>({})
+  const [query,       setQuery]       = useState('')
+  const [filter,      setFilter]      = useState<'all' | 'active' | 'inactive'>('all')
   const toast = useToastStore()
 
   const loadSessions = useCallback(async () => {
-    const data = await window.electron.invoke<Session[]>('activity:getDay', toDateStr(date))
-    setSessions(data ?? [])
+    const data = await window.electron.invoke<{ sessions: Session[]; events: SystemEvent[] }>('activity:getDayDetails', toDateStr(date))
+    setSessions(data?.sessions ?? [])
+    setEvents(data?.events ?? [])
   }, [date])
 
   const loadHeatmap = useCallback(async () => {
@@ -453,13 +589,28 @@ export default function ActivityLog() {
   async function clearDay() {
     await window.electron.invoke('activity:deleteDay', toDateStr(date))
     setSessions([])
+    setEvents([])
     setHeatmapData(prev => { const n = { ...prev }; delete n[toDateStr(date)]; return n })
     toast.show('已清除当天记录', 'info')
   }
 
-  const totalMs  = sessions.reduce((a, s) => a + (s.end - s.start), 0)
-  const reversed = [...sessions].reverse()
-  const hasSites = sessions.some(s => s.url)
+  async function exportDay(format: 'json' | 'csv') {
+    const ok = await window.electron.invoke<boolean>('activity:exportDay', { date: toDateStr(date), format })
+    if (ok) toast.show(`${format.toUpperCase()} 已导出`, 'success')
+  }
+
+  const activeSessions = sessions.filter(isActiveSession)
+  const totalMs = activeSessions.reduce((a, s) => a + (s.end - s.start), 0)
+  const normalizedQuery = query.trim().toLowerCase()
+  const filteredSessions = sessions.filter(s => {
+    if (filter === 'active' && !isActiveSession(s)) return false
+    if (filter === 'inactive' && isActiveSession(s)) return false
+    if (!normalizedQuery) return true
+    return [s.app, s.title, s.url, s.description, s.processPath]
+      .some(value => String(value ?? '').toLowerCase().includes(normalizedQuery))
+  })
+  const reversed = [...filteredSessions].reverse()
+  const hasSites = activeSessions.some(s => s.url)
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -494,6 +645,12 @@ export default function ActivityLog() {
             <span className="text-[11px] text-secondary">{fmtDuration(totalMs)}</span>
           )}
           {sessions.length > 0 && (
+            <div className="flex items-center overflow-hidden rounded border border-dividerLight">
+              <button onClick={() => exportDay('csv')} title="导出 CSV" className="px-2 py-1 text-[10px] text-secondary hover:text-accent">CSV</button>
+              <button onClick={() => exportDay('json')} title="导出 JSON" className="border-l border-dividerLight px-2 py-1 text-[10px] text-secondary hover:text-accent">JSON</button>
+            </div>
+          )}
+          {sessions.length > 0 && (
             <button onClick={clearDay} title="清除本日记录"
               className="flex h-7 w-7 items-center justify-center rounded text-secondary transition-colors hover:bg-red-500/15 hover:text-red-400">
               <Trash2 size={13} />
@@ -526,7 +683,15 @@ export default function ActivityLog() {
           </div>
         ) : (
           <>
+            <SummaryCards sessions={sessions} />
             <DayTimeline sessions={sessions} date={date} />
+
+            <HourlyChart sessions={sessions} date={date} />
+
+            <div className="mx-4 border-t border-dividerLight" />
+            <div className="pt-3"><CategoryStats sessions={sessions} /></div>
+
+            <SystemEvents events={events} />
 
             <div className="mx-4 border-t border-dividerLight" />
             <div className="pt-3">
@@ -544,10 +709,27 @@ export default function ActivityLog() {
 
             <div className="mx-4 border-t border-dividerLight" />
             <div className="py-2">
-              <p className="px-4 pb-1.5 text-[11px] font-semibold uppercase tracking-wide text-secondary">
-                详细记录 · {sessions.length} 条
-              </p>
-              {reversed.map(s => <SessionRow key={s.start} s={s} />)}
+              <div className="flex items-center gap-2 px-4 pb-2">
+                <p className="mr-auto text-[11px] font-semibold uppercase tracking-wide text-secondary">
+                  详细记录 · {filteredSessions.length}/{sessions.length} 条
+                </p>
+                <div className="flex overflow-hidden rounded border border-dividerLight text-[10px]">
+                  {(['all', 'active', 'inactive'] as const).map(value => (
+                    <button key={value} onClick={() => setFilter(value)}
+                      className={`px-2 py-1 ${filter === value ? 'bg-accent/15 text-accent' : 'text-secondary hover:text-secondaryDark'}`}>
+                      {value === 'all' ? '全部' : value === 'active' ? '活动' : '非活动'}
+                    </button>
+                  ))}
+                </div>
+                <label className="flex items-center gap-1.5 rounded border border-dividerLight px-2 py-1">
+                  <Search size={10} className="text-secondary" />
+                  <input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索应用、标题、域名"
+                    className="w-36 bg-transparent text-[10px] text-secondaryDark outline-none placeholder:text-secondary" />
+                </label>
+                <Download size={11} className="text-secondary" />
+              </div>
+              {reversed.map((s, index) => <SessionRow key={`${s.start}-${s.state}-${index}`} s={s} />)}
+              {reversed.length === 0 && <p className="py-6 text-center text-[11px] text-secondary">没有匹配的记录</p>}
               <div className="h-4" />
             </div>
           </>

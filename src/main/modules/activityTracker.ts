@@ -4,7 +4,7 @@
  * Captures: process name, window title, browser URL (via UI Automation), idle time.
  * Sessions are stored next to the application in activity/YYYY-MM-DD.json.
  */
-import { app, ipcMain, shell } from 'electron'
+import { app, dialog, ipcMain, shell } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import { dirname, join } from 'path'
 import {
@@ -18,6 +18,15 @@ export interface ActivitySession {
   start: number  // unix ms
   end:   number  // unix ms
   url?:  string  // browser URL (if captured)
+  state?: 'active' | 'idle' | 'locked' | 'sleep'
+  pid?: number
+  processPath?: string
+  description?: string
+}
+
+export interface ActivityEvent {
+  type: 'startup' | 'shutdown' | 'suspend' | 'resume' | 'lock' | 'unlock'
+  time: number
 }
 
 // ── PowerShell loop ──────────────────────────────────────────────────────────
@@ -86,7 +95,8 @@ while ($true) {
 
     $pid2 = [uint32]0
     [SxActivity]::GetWindowThreadProcessId($h, [ref]$pid2) | Out-Null
-    $n    = (Get-Process -Id $pid2 -EA SilentlyContinue).ProcessName
+    $p    = Get-Process -Id $pid2 -EA SilentlyContinue
+    $n    = $p.ProcessName
 
     $idle = [SxActivity]::GetIdleMs()
 
@@ -95,7 +105,10 @@ while ($true) {
         $url = Get-BrowserUrl $h
     }
 
-    $row = [PSCustomObject]@{ app=$n; title=$title; url=$url; idleMs=$idle }
+    $row = [PSCustomObject]@{
+      app=$n; title=$title; url=$url; idleMs=$idle; pid=[int]$pid2
+      processPath=$p.Path; description=$p.Description
+    }
     [Console]::Out.Flush()
     [Console]::WriteLine(($row | ConvertTo-Json -Compress))
     [Console]::Out.Flush()
@@ -112,7 +125,7 @@ function copyLegacyActivityData(target: string): void {
   if (!existsSync(legacy) || legacy.toLowerCase() === target.toLowerCase()) return
   try {
     for (const file of readdirSync(legacy)) {
-      if (!/^(?:\d{4}-\d{2}-\d{2}\.json(?:\.bak)?|_settings\.json|_current\.json)$/.test(file)) continue
+      if (!/^(?:\d{4}-\d{2}-\d{2}(?:\.events)?\.json(?:\.bak)?|_settings\.json|_current\.json)$/.test(file)) continue
       const destination = join(target, file)
       if (!existsSync(destination)) copyFileSync(join(legacy, file), destination)
     }
@@ -153,6 +166,16 @@ function loadDay(date: string): ActivitySession[] {
   }
 }
 
+function loadEvents(date: string): ActivityEvent[] {
+  const file = join(getDir(), `${date}.events.json`)
+  if (!existsSync(file)) return []
+  try { return JSON.parse(readFileSync(file, 'utf8')) as ActivityEvent[] }
+  catch {
+    try { return JSON.parse(readFileSync(`${file}.bak`, 'utf8')) as ActivityEvent[] }
+    catch { return [] }
+  }
+}
+
 function writeJsonAtomic(file: string, value: unknown, backup = false): void {
   const tmp = `${file}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(value), 'utf8')
@@ -189,6 +212,16 @@ function appendSession(s: ActivitySession): void {
   }
 }
 
+function appendEvent(event: ActivityEvent): void {
+  const date = dateKey(event.time)
+  const file = join(getDir(), `${date}.events.json`)
+  const events = loadEvents(date)
+  const previous = events[events.length - 1]
+  if (previous?.type === event.type && Math.abs(previous.time - event.time) < 2000) return
+  events.push(event)
+  writeJsonAtomic(file, events, true)
+}
+
 function settingsPath(): string { return join(getDir(), '_settings.json') }
 function checkpointPath(): string { return join(getDir(), '_current.json') }
 
@@ -206,7 +239,7 @@ function cleanupOldData(retentionDays = 365): void {
   cutoff.setHours(0, 0, 0, 0)
   cutoff.setDate(cutoff.getDate() - retentionDays)
   for (const file of readdirSync(getDir())) {
-    const match = file.match(/^(\d{4}-\d{2}-\d{2})\.json(?:\.bak)?$/)
+    const match = file.match(/^(\d{4}-\d{2}-\d{2})(?:\.events)?\.json(?:\.bak)?$/)
     if (!match) continue
     const date = new Date(`${match[1]}T00:00:00`)
     if (date < cutoff) try { unlinkSync(join(getDir(), file)) } catch {}
@@ -216,14 +249,22 @@ function cleanupOldData(retentionDays = 365): void {
 // ── Tracker state ────────────────────────────────────────────────────────────
 
 let proc:    ChildProcess | null = null
-let current: { app: string; title: string; url: string; start: number; lastActiveAt: number } | null = null
+type CurrentActivity = {
+  app: string; title: string; url: string; start: number; lastActiveAt: number
+  pid?: number; processPath?: string; description?: string
+}
+type InactiveActivity = { state: 'idle' | 'locked' | 'sleep'; start: number }
+
+let current: CurrentActivity | null = null
+let inactive: InactiveActivity | null = null
+let lastSampleAt = 0
 let enabled  = false
 let restartTimer: NodeJS.Timeout | null = null
 
 const SAMPLE_GRACE_MS = 6500
 
 function saveCheckpoint(): void {
-  if (current) writeJsonAtomic(checkpointPath(), current)
+  if (current || inactive) writeJsonAtomic(checkpointPath(), { current, inactive, lastSampleAt })
 }
 
 function removeCheckpoint(): void {
@@ -233,17 +274,52 @@ function removeCheckpoint(): void {
 function recoverCheckpoint(): void {
   if (!existsSync(checkpointPath())) return
   try {
-    const saved = JSON.parse(readFileSync(checkpointPath(), 'utf8')) as typeof current
+    const raw = JSON.parse(readFileSync(checkpointPath(), 'utf8')) as {
+      current?: CurrentActivity | null; inactive?: InactiveActivity | null; lastSampleAt?: number
+      app?: string; title?: string; url?: string; start?: number; lastActiveAt?: number
+    }
+    const saved = raw.current ?? (raw.app && raw.start && raw.lastActiveAt ? raw as CurrentActivity : null)
     if (saved) {
       const end = Math.min(Date.now(), saved.lastActiveAt + SAMPLE_GRACE_MS)
       if (end - saved.start > 4000) {
-        const session: ActivitySession = { app: saved.app, title: saved.title, start: saved.start, end }
+        const session: ActivitySession = {
+          app: saved.app, title: saved.title, start: saved.start, end, state: 'active',
+          pid: saved.pid, processPath: saved.processPath, description: saved.description,
+        }
         if (saved.url) session.url = saved.url
         appendSession(session)
       }
     }
+    if (raw.inactive) {
+      const end = Math.min(Date.now(), (raw.lastSampleAt || raw.inactive.start) + SAMPLE_GRACE_MS)
+      if (end - raw.inactive.start > 4000) appendInactiveSession(raw.inactive, end)
+    }
   } catch {}
   removeCheckpoint()
+}
+
+const INACTIVE_LABELS = { idle: '空闲', locked: '锁屏', sleep: '休眠' } as const
+
+function appendInactiveSession(value: InactiveActivity, end: number): void {
+  if (end - value.start <= 4000) return
+  appendSession({
+    app: 'System', title: INACTIVE_LABELS[value.state], state: value.state,
+    start: value.start, end,
+  })
+}
+
+function flushInactive(end = Date.now()): void {
+  if (inactive) appendInactiveSession(inactive, end)
+  inactive = null
+  removeCheckpoint()
+}
+
+function startInactive(state: InactiveActivity['state'], start = Date.now()): void {
+  if (inactive?.state === state) return
+  flush(start)
+  flushInactive(start)
+  inactive = { state, start }
+  saveCheckpoint()
 }
 
 function sanitizeUrl(raw: string): string {
@@ -258,7 +334,11 @@ function flush(end = Date.now()) {
   if (current) {
     // Never count a suspend, lock, power loss or long polling gap as active use.
     const safeEnd = Math.min(end, current.lastActiveAt + SAMPLE_GRACE_MS)
-    const s: ActivitySession = { app: current.app, title: current.title, start: current.start, end: safeEnd }
+    const s: ActivitySession = {
+      app: current.app, title: current.title, start: current.start, end: safeEnd,
+      state: 'active', pid: current.pid, processPath: current.processPath,
+      description: current.description,
+    }
     if (current.url) s.url = current.url
     if (safeEnd - current.start > 4000) appendSession(s)
   }
@@ -267,7 +347,10 @@ function flush(end = Date.now()) {
 }
 
 function handleLine(line: string) {
-  let row: { app?: string; title?: string; url?: string; idleMs?: number }
+  let row: {
+    app?: string; title?: string; url?: string; idleMs?: number
+    pid?: number; processPath?: string; description?: string
+  }
   try { row = JSON.parse(line) } catch { return }
   const appName = String(row.app ?? '').trim()
   const title   = String(row.title ?? '').trim()
@@ -278,15 +361,36 @@ function handleLine(line: string) {
 
   const now = Date.now()
 
+  // A long gap means the polling process was suspended with the computer.
+  if (lastSampleAt && now - lastSampleAt > 30_000 && inactive?.state !== 'locked') {
+    const gapStart = lastSampleAt + SAMPLE_GRACE_MS
+    flush(gapStart)
+    flushInactive(gapStart)
+    if (now - gapStart > 4000) appendInactiveSession({ state: 'sleep', start: gapStart }, now)
+  }
+  lastSampleAt = now
+
+  if (['lockapp', 'logonui'].includes(appName.toLowerCase())) {
+    startInactive('locked', now)
+    return
+  }
   // Treat as idle if no input for > 60 s — flush but don't start a new session
   if (idleMs > 60_000) {
-    flush(now)
+    if (!inactive || inactive.state === 'idle') startInactive('idle', now)
+    saveCheckpoint()
     return
   }
 
+  if (inactive) flushInactive(now)
+
   if (!current || current.app !== appName || current.title !== title || current.url !== url) {
     flush(now)
-    current = { app: appName, title, url, start: now, lastActiveAt: now }
+    current = {
+      app: appName, title, url, start: now, lastActiveAt: now,
+      pid: Number(row.pid) || undefined,
+      processPath: String(row.processPath ?? '').trim() || undefined,
+      description: String(row.description ?? '').trim() || undefined,
+    }
   } else {
     current.lastActiveAt = now
   }
@@ -321,11 +425,26 @@ function startProcess() {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+export function recordSystemEvent(type: ActivityEvent['type']): void {
+  if (!enabled) return
+  const now = Date.now()
+  appendEvent({ type, time: now })
+  if (type === 'suspend') startInactive('sleep', now)
+  else if (type === 'lock') startInactive('locked', now)
+  else if (type === 'resume' || type === 'unlock') {
+    flushInactive(now)
+    lastSampleAt = now
+  }
+}
+
 export function initializeTracking() {
   recoverCheckpoint()
   cleanupOldData()
   enabled = loadTrackingEnabled()
-  if (enabled) startProcess()
+  if (enabled) {
+    appendEvent({ type: 'startup', time: Date.now() })
+    startProcess()
+  }
 }
 export function startTracking()  {
   enabled = true
@@ -338,15 +457,19 @@ export function stopTracking()   {
   if (restartTimer) clearTimeout(restartTimer)
   restartTimer = null
   flush()
+  flushInactive()
   proc?.kill()
   proc = null
 }
 export function isTracking()     { return enabled && proc !== null }
 export function flushAndStop()   {
+  const wasEnabled = enabled
   enabled = false
   if (restartTimer) clearTimeout(restartTimer)
   restartTimer = null
   flush()
+  flushInactive()
+  if (wasEnabled) appendEvent({ type: 'shutdown', time: Date.now() })
   proc?.kill()
   proc = null
 }
@@ -355,21 +478,60 @@ export function flushAndStop()   {
 
 function loadDayWithCurrent(date: string): ActivitySession[] {
   const sessions = loadDay(date)
-  if (!current) return sessions
-  const end = Math.min(Date.now(), current.lastActiveAt + SAMPLE_GRACE_MS)
-  const live: ActivitySession = {
-    app: current.app, title: current.title, start: current.start, end,
-    ...(current.url ? { url: current.url } : {}),
+  if (current) {
+    const end = Math.min(Date.now(), current.lastActiveAt + SAMPLE_GRACE_MS)
+    const live: ActivitySession = {
+      app: current.app, title: current.title, start: current.start, end, state: 'active',
+      pid: current.pid, processPath: current.processPath, description: current.description,
+      ...(current.url ? { url: current.url } : {}),
+    }
+    const part = splitSessionByDay(live).find(s => dateKey(s.start) === date)
+    if (part && part.end > part.start) sessions.push(part)
   }
-  const part = splitSessionByDay(live).find(s => dateKey(s.start) === date)
-  if (part && part.end > part.start) sessions.push(part)
+  if (inactive) {
+    const live: ActivitySession = {
+      app: 'System', title: INACTIVE_LABELS[inactive.state], state: inactive.state,
+      start: inactive.start, end: Date.now(),
+    }
+    const part = splitSessionByDay(live).find(s => dateKey(s.start) === date)
+    if (part && part.end > part.start) sessions.push(part)
+  }
   return sessions
+}
+
+function csvCell(value: unknown): string {
+  return `"${String(value ?? '').replace(/"/g, '""')}"`
 }
 
 export function setupActivityIPC(): void {
   ipcMain.handle('activity:getDataDir', () => getDir())
   ipcMain.handle('activity:openDataDir', () => shell.openPath(getDir()))
   ipcMain.handle('activity:getDay', (_e, date: string) => loadDayWithCurrent(date))
+  ipcMain.handle('activity:getDayDetails', (_e, date: string) => ({
+    sessions: loadDayWithCurrent(date), events: loadEvents(date),
+  }))
+
+  ipcMain.handle('activity:exportDay', async (_e, { date, format }: { date: string; format: 'json' | 'csv' }) => {
+    const details = { date, sessions: loadDayWithCurrent(date), events: loadEvents(date) }
+    const result = await dialog.showSaveDialog({
+      title: '导出活动记录', defaultPath: `activity-${date}.${format}`,
+      filters: [{ name: format.toUpperCase(), extensions: [format] }],
+    })
+    if (result.canceled || !result.filePath) return false
+    if (format === 'json') writeFileSync(result.filePath, JSON.stringify(details, null, 2), 'utf8')
+    else {
+      const rows = [
+        ['状态', '应用', '说明', '窗口标题', '网站域名', '开始', '结束', '时长秒', '进程路径'],
+        ...details.sessions.map(s => [
+          s.state ?? 'active', s.app, s.description ?? '', s.title, s.url ?? '',
+          new Date(s.start).toLocaleString('zh-CN'), new Date(s.end).toLocaleString('zh-CN'),
+          Math.round((s.end - s.start) / 1000), s.processPath ?? '',
+        ]),
+      ]
+      writeFileSync(result.filePath, '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n'), 'utf8')
+    }
+    return true
+  })
 
   ipcMain.handle('activity:getDays', () => {
     try {
@@ -396,6 +558,9 @@ export function setupActivityIPC(): void {
     const f = join(getDir(), `${date}.json`)
     if (existsSync(f)) unlinkSync(f)
     if (existsSync(`${f}.bak`)) unlinkSync(`${f}.bak`)
+    const eventsFile = join(getDir(), `${date}.events.json`)
+    if (existsSync(eventsFile)) unlinkSync(eventsFile)
+    if (existsSync(`${eventsFile}.bak`)) unlinkSync(`${eventsFile}.bak`)
   })
 
   ipcMain.handle('activity:getHeatmap', () => {
@@ -404,7 +569,9 @@ export function setupActivityIPC(): void {
       const files = readdirSync(getDir()).filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
       for (const file of files) {
         const date    = file.replace('.json', '')
-        const totalMs = loadDayWithCurrent(date).reduce((s, session) => s + (session.end - session.start), 0)
+        const totalMs = loadDayWithCurrent(date)
+          .filter(session => !session.state || session.state === 'active')
+          .reduce((s, session) => s + (session.end - session.start), 0)
         if (totalMs > 0) result[date] = totalMs
       }
       if (current) {
@@ -412,7 +579,9 @@ export function setupActivityIPC(): void {
           app: current.app, title: current.title, start: current.start,
           end: Math.min(Date.now(), current.lastActiveAt + SAMPLE_GRACE_MS),
         }).map(s => dateKey(s.start)))) {
-          const totalMs = loadDayWithCurrent(date).reduce((sum, session) => sum + (session.end - session.start), 0)
+          const totalMs = loadDayWithCurrent(date)
+            .filter(session => !session.state || session.state === 'active')
+            .reduce((sum, session) => sum + (session.end - session.start), 0)
           if (totalMs > 0) result[date] = totalMs
         }
       }
