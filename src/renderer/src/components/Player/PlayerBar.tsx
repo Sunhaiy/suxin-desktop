@@ -37,6 +37,9 @@ export default function PlayerBar() {
       el.volume = volume
       el.load()
       el.play().catch(() => { setPlaying(false); toast.show('播放失败', 'error') })
+      window.electron.invoke('activity:mediaEvent', {
+        type: 'music-play', label: currentTrack.title, detail: currentTrack.artist,
+      })
     } else {
       el.pause(); el.src = ''
     }
@@ -63,6 +66,9 @@ export default function PlayerBar() {
   }, [])
 
   function handleEnded() {
+    if (currentTrack) window.electron.invoke('activity:mediaEvent', {
+      type: 'music-end', label: currentTrack.title, detail: currentTrack.artist,
+    })
     if (playMode === 'repeat-one' && audioRef.current) {
       audioRef.current.currentTime = 0
       audioRef.current.play().catch(() => setPlaying(false))

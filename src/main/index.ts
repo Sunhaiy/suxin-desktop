@@ -28,6 +28,7 @@ import { setupLocalWallpaperIPC } from './modules/localWallpaper'
 // local-img:// 协议必须在 app ready 前注册
 protocol.registerSchemesAsPrivileged([
   { scheme: 'local-img', privileges: { bypassCSP: true, corsEnabled: true, supportFetchAPI: true } },
+  { scheme: 'local-media', privileges: { bypassCSP: true, corsEnabled: true, supportFetchAPI: true, stream: true } },
 ])
 
 // Windows 11 任务栏媒体控制 (SMTC) 必须在 app ready 前设置
@@ -145,6 +146,11 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
 
   // 本地图片协议处理
   protocol.handle('local-img', (request) => {
+    const fp = new URL(request.url).searchParams.get('p') ?? ''
+    if (!fp) return new Response('', { status: 404 })
+    return net.fetch(`file:///${fp}`)
+  })
+  protocol.handle('local-media', (request) => {
     const fp = new URL(request.url).searchParams.get('p') ?? ''
     if (!fp) return new Response('', { status: 404 })
     return net.fetch(`file:///${fp}`)

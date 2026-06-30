@@ -4,9 +4,10 @@
  * Captures: process name, window title, browser URL (via UI Automation), idle time.
  * Sessions are stored next to the application in activity/YYYY-MM-DD.json.
  */
-import { app, dialog, ipcMain, shell } from 'electron'
+import { app, dialog, ipcMain, powerMonitor, shell } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import { dirname, join } from 'path'
+import { cpus, freemem, networkInterfaces, totalmem, uptime } from 'os'
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync,
   renameSync, copyFileSync,
@@ -22,11 +23,25 @@ export interface ActivitySession {
   pid?: number
   processPath?: string
   description?: string
+  keyCount?: number
+  clickCount?: number
+  mouseDistance?: number
 }
 
 export interface ActivityEvent {
-  type: 'startup' | 'shutdown' | 'suspend' | 'resume' | 'lock' | 'unlock'
+  type: 'startup' | 'shutdown' | 'suspend' | 'resume' | 'lock' | 'unlock' | 'music-play' | 'music-end'
   time: number
+  label?: string
+  detail?: string
+}
+
+export interface SystemMetric {
+  time: number
+  cpu: number
+  memory: number
+  uptime: number
+  online: boolean
+  onBattery: boolean
 }
 
 // ── PowerShell loop ──────────────────────────────────────────────────────────
@@ -45,6 +60,9 @@ public class SxActivity {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
 
   [StructLayout(LayoutKind.Sequential)]
   private struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
@@ -87,6 +105,10 @@ function Get-BrowserUrl([IntPtr]$hwnd) {
     return ''
 }
 
+$keyCount=0; $clickCount=0; $mouseDistance=0.0
+$lastPoint = New-Object SxActivity+POINT
+[SxActivity]::GetCursorPos([ref]$lastPoint) | Out-Null
+
 while ($true) {
     $h    = [SxActivity]::GetForegroundWindow()
     $sb   = New-Object System.Text.StringBuilder(512)
@@ -108,11 +130,22 @@ while ($true) {
     $row = [PSCustomObject]@{
       app=$n; title=$title; url=$url; idleMs=$idle; pid=[int]$pid2
       processPath=$p.Path; description=$p.Description
+      keyCount=$keyCount; clickCount=$clickCount; mouseDistance=[math]::Round($mouseDistance)
     }
     [Console]::Out.Flush()
     [Console]::WriteLine(($row | ConvertTo-Json -Compress))
     [Console]::Out.Flush()
-    Start-Sleep -Seconds 5
+    $keyCount=0; $clickCount=0; $mouseDistance=0.0
+    for($sample=0; $sample -lt 20; $sample++) {
+      foreach($vk in 1,2,4) { if(([SxActivity]::GetAsyncKeyState($vk) -band 1) -ne 0) { $clickCount++ } }
+      for($vk=8; $vk -le 254; $vk++) { if(([SxActivity]::GetAsyncKeyState($vk) -band 1) -ne 0) { $keyCount++ } }
+      $point = New-Object SxActivity+POINT
+      if([SxActivity]::GetCursorPos([ref]$point)) {
+        $dx=$point.X-$lastPoint.X; $dy=$point.Y-$lastPoint.Y
+        $mouseDistance += [math]::Sqrt($dx*$dx+$dy*$dy); $lastPoint=$point
+      }
+      Start-Sleep -Milliseconds 250
+    }
 }
 `
 
@@ -125,7 +158,7 @@ function copyLegacyActivityData(target: string): void {
   if (!existsSync(legacy) || legacy.toLowerCase() === target.toLowerCase()) return
   try {
     for (const file of readdirSync(legacy)) {
-      if (!/^(?:\d{4}-\d{2}-\d{2}(?:\.events)?\.json(?:\.bak)?|_settings\.json|_current\.json)$/.test(file)) continue
+      if (!/^(?:\d{4}-\d{2}-\d{2}(?:\.(?:events|note|metrics))?\.json(?:\.bak)?|_settings\.json|_current\.json)$/.test(file)) continue
       const destination = join(target, file)
       if (!existsSync(destination)) copyFileSync(join(legacy, file), destination)
     }
@@ -176,6 +209,11 @@ function loadEvents(date: string): ActivityEvent[] {
   }
 }
 
+function loadMetrics(date: string): SystemMetric[] {
+  const file = join(getDir(), `${date}.metrics.json`)
+  try { return JSON.parse(readFileSync(file, 'utf8')) as SystemMetric[] } catch { return [] }
+}
+
 function writeJsonAtomic(file: string, value: unknown, backup = false): void {
   const tmp = `${file}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(value), 'utf8')
@@ -222,6 +260,14 @@ function appendEvent(event: ActivityEvent): void {
   writeJsonAtomic(file, events, true)
 }
 
+function appendMetric(metric: SystemMetric): void {
+  const date = dateKey(metric.time)
+  const file = join(getDir(), `${date}.metrics.json`)
+  const metrics = loadMetrics(date)
+  metrics.push(metric)
+  writeJsonAtomic(file, metrics.slice(-1500))
+}
+
 function settingsPath(): string { return join(getDir(), '_settings.json') }
 function checkpointPath(): string { return join(getDir(), '_current.json') }
 
@@ -239,7 +285,7 @@ function cleanupOldData(retentionDays = 365): void {
   cutoff.setHours(0, 0, 0, 0)
   cutoff.setDate(cutoff.getDate() - retentionDays)
   for (const file of readdirSync(getDir())) {
-    const match = file.match(/^(\d{4}-\d{2}-\d{2})(?:\.events)?\.json(?:\.bak)?$/)
+    const match = file.match(/^(\d{4}-\d{2}-\d{2})(?:\.(?:events|note|metrics))?\.json(?:\.bak)?$/)
     if (!match) continue
     const date = new Date(`${match[1]}T00:00:00`)
     if (date < cutoff) try { unlinkSync(join(getDir(), file)) } catch {}
@@ -252,6 +298,7 @@ let proc:    ChildProcess | null = null
 type CurrentActivity = {
   app: string; title: string; url: string; start: number; lastActiveAt: number
   pid?: number; processPath?: string; description?: string
+  keyCount: number; clickCount: number; mouseDistance: number
 }
 type InactiveActivity = { state: 'idle' | 'locked' | 'sleep'; start: number }
 
@@ -260,8 +307,43 @@ let inactive: InactiveActivity | null = null
 let lastSampleAt = 0
 let enabled  = false
 let restartTimer: NodeJS.Timeout | null = null
+let metricTimer: NodeJS.Timeout | null = null
+let previousCpu: { idle: number; total: number } | null = null
 
 const SAMPLE_GRACE_MS = 6500
+
+function cpuTotals() {
+  return cpus().reduce((sum, cpu) => {
+    const total = Object.values(cpu.times).reduce((value, time) => value + time, 0)
+    return { idle: sum.idle + cpu.times.idle, total: sum.total + total }
+  }, { idle: 0, total: 0 })
+}
+
+function sampleSystemMetrics(): void {
+  if (!enabled) return
+  const nowCpu = cpuTotals()
+  const deltaIdle = previousCpu ? nowCpu.idle - previousCpu.idle : 0
+  const deltaTotal = previousCpu ? nowCpu.total - previousCpu.total : 0
+  previousCpu = nowCpu
+  const online = Object.values(networkInterfaces()).flat().some(info => info && !info.internal)
+  appendMetric({
+    time: Date.now(), cpu: deltaTotal > 0 ? Math.round((1 - deltaIdle / deltaTotal) * 100) : 0,
+    memory: Math.round((1 - freemem() / totalmem()) * 100), uptime: Math.round(uptime()),
+    online, onBattery: powerMonitor.isOnBatteryPower(),
+  })
+}
+
+function startMetricSampler(): void {
+  if (metricTimer) return
+  previousCpu = cpuTotals()
+  metricTimer = setInterval(sampleSystemMetrics, 60_000)
+  setTimeout(sampleSystemMetrics, 5000)
+}
+
+function stopMetricSampler(): void {
+  if (metricTimer) clearInterval(metricTimer)
+  metricTimer = null
+}
 
 function saveCheckpoint(): void {
   if (current || inactive) writeJsonAtomic(checkpointPath(), { current, inactive, lastSampleAt })
@@ -285,6 +367,7 @@ function recoverCheckpoint(): void {
         const session: ActivitySession = {
           app: saved.app, title: saved.title, start: saved.start, end, state: 'active',
           pid: saved.pid, processPath: saved.processPath, description: saved.description,
+          keyCount: saved.keyCount, clickCount: saved.clickCount, mouseDistance: saved.mouseDistance,
         }
         if (saved.url) session.url = saved.url
         appendSession(session)
@@ -338,6 +421,7 @@ function flush(end = Date.now()) {
       app: current.app, title: current.title, start: current.start, end: safeEnd,
       state: 'active', pid: current.pid, processPath: current.processPath,
       description: current.description,
+      keyCount: current.keyCount, clickCount: current.clickCount, mouseDistance: current.mouseDistance,
     }
     if (current.url) s.url = current.url
     if (safeEnd - current.start > 4000) appendSession(s)
@@ -350,6 +434,7 @@ function handleLine(line: string) {
   let row: {
     app?: string; title?: string; url?: string; idleMs?: number
     pid?: number; processPath?: string; description?: string
+    keyCount?: number; clickCount?: number; mouseDistance?: number
   }
   try { row = JSON.parse(line) } catch { return }
   const appName = String(row.app ?? '').trim()
@@ -390,9 +475,15 @@ function handleLine(line: string) {
       pid: Number(row.pid) || undefined,
       processPath: String(row.processPath ?? '').trim() || undefined,
       description: String(row.description ?? '').trim() || undefined,
+      keyCount: Number(row.keyCount) || 0,
+      clickCount: Number(row.clickCount) || 0,
+      mouseDistance: Number(row.mouseDistance) || 0,
     }
   } else {
     current.lastActiveAt = now
+    current.keyCount += Number(row.keyCount) || 0
+    current.clickCount += Number(row.clickCount) || 0
+    current.mouseDistance += Number(row.mouseDistance) || 0
   }
   saveCheckpoint()
 }
@@ -444,18 +535,21 @@ export function initializeTracking() {
   if (enabled) {
     appendEvent({ type: 'startup', time: Date.now() })
     startProcess()
+    startMetricSampler()
   }
 }
 export function startTracking()  {
   enabled = true
   saveTrackingEnabled(true)
   startProcess()
+  startMetricSampler()
 }
 export function stopTracking()   {
   enabled = false
   saveTrackingEnabled(false)
   if (restartTimer) clearTimeout(restartTimer)
   restartTimer = null
+  stopMetricSampler()
   flush()
   flushInactive()
   proc?.kill()
@@ -467,6 +561,7 @@ export function flushAndStop()   {
   enabled = false
   if (restartTimer) clearTimeout(restartTimer)
   restartTimer = null
+  stopMetricSampler()
   flush()
   flushInactive()
   if (wasEnabled) appendEvent({ type: 'shutdown', time: Date.now() })
@@ -483,6 +578,7 @@ function loadDayWithCurrent(date: string): ActivitySession[] {
     const live: ActivitySession = {
       app: current.app, title: current.title, start: current.start, end, state: 'active',
       pid: current.pid, processPath: current.processPath, description: current.description,
+      keyCount: current.keyCount, clickCount: current.clickCount, mouseDistance: current.mouseDistance,
       ...(current.url ? { url: current.url } : {}),
     }
     const part = splitSessionByDay(live).find(s => dateKey(s.start) === date)
@@ -508,11 +604,22 @@ export function setupActivityIPC(): void {
   ipcMain.handle('activity:openDataDir', () => shell.openPath(getDir()))
   ipcMain.handle('activity:getDay', (_e, date: string) => loadDayWithCurrent(date))
   ipcMain.handle('activity:getDayDetails', (_e, date: string) => ({
-    sessions: loadDayWithCurrent(date), events: loadEvents(date),
+    sessions: loadDayWithCurrent(date), events: loadEvents(date), metrics: loadMetrics(date),
+    note: (() => { try { return JSON.parse(readFileSync(join(getDir(), `${date}.note.json`), 'utf8')) } catch { return { text: '', mood: '', tags: [] } } })(),
   }))
+  ipcMain.handle('activity:saveNote', (_e, { date, note }: { date: string; note: unknown }) => {
+    writeJsonAtomic(join(getDir(), `${date}.note.json`), note, true)
+  })
+  ipcMain.handle('activity:mediaEvent', (_e, event: { type: 'music-play' | 'music-end'; label?: string; detail?: string }) => {
+    if (!enabled || !event || !['music-play', 'music-end'].includes(event.type)) return
+    appendEvent({ type: event.type, time: Date.now(), label: event.label, detail: event.detail })
+  })
 
   ipcMain.handle('activity:exportDay', async (_e, { date, format }: { date: string; format: 'json' | 'csv' }) => {
-    const details = { date, sessions: loadDayWithCurrent(date), events: loadEvents(date) }
+    const details = {
+      date, sessions: loadDayWithCurrent(date), events: loadEvents(date), metrics: loadMetrics(date),
+      note: (() => { try { return JSON.parse(readFileSync(join(getDir(), `${date}.note.json`), 'utf8')) } catch { return null } })(),
+    }
     const result = await dialog.showSaveDialog({
       title: '导出活动记录', defaultPath: `activity-${date}.${format}`,
       filters: [{ name: format.toUpperCase(), extensions: [format] }],
@@ -521,11 +628,12 @@ export function setupActivityIPC(): void {
     if (format === 'json') writeFileSync(result.filePath, JSON.stringify(details, null, 2), 'utf8')
     else {
       const rows = [
-        ['状态', '应用', '说明', '窗口标题', '网站域名', '开始', '结束', '时长秒', '进程路径'],
+        ['状态', '应用', '说明', '窗口标题', '网站域名', '开始', '结束', '时长秒', '按键次数', '点击次数', '鼠标距离像素', '进程路径'],
         ...details.sessions.map(s => [
           s.state ?? 'active', s.app, s.description ?? '', s.title, s.url ?? '',
           new Date(s.start).toLocaleString('zh-CN'), new Date(s.end).toLocaleString('zh-CN'),
-          Math.round((s.end - s.start) / 1000), s.processPath ?? '',
+          Math.round((s.end - s.start) / 1000), s.keyCount ?? 0, s.clickCount ?? 0,
+          Math.round(s.mouseDistance ?? 0), s.processPath ?? '',
         ]),
       ]
       writeFileSync(result.filePath, '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n'), 'utf8')
@@ -561,6 +669,11 @@ export function setupActivityIPC(): void {
     const eventsFile = join(getDir(), `${date}.events.json`)
     if (existsSync(eventsFile)) unlinkSync(eventsFile)
     if (existsSync(`${eventsFile}.bak`)) unlinkSync(`${eventsFile}.bak`)
+    for (const suffix of ['note', 'metrics']) {
+      const file = join(getDir(), `${date}.${suffix}.json`)
+      if (existsSync(file)) unlinkSync(file)
+      if (existsSync(`${file}.bak`)) unlinkSync(`${file}.bak`)
+    }
   })
 
   ipcMain.handle('activity:getHeatmap', () => {

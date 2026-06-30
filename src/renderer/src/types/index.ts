@@ -7,9 +7,12 @@ export interface Track {
   duration: number
   source: MusicSource
   url?: string
+  path?: string
+  lyricPath?: string
+  modifiedAt?: number
 }
 
-export type MusicSource = 'netease' | 'qq' | 'kugou' | 'kuwo' | 'bilibili' | 'migu' | 'taihe'
+export type MusicSource = 'local' | 'netease' | 'qq' | 'kugou' | 'kuwo' | 'bilibili' | 'migu' | 'taihe'
 
 export interface SearchResult {
   tracks: Track[]

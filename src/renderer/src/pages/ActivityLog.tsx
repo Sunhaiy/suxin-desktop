@@ -11,12 +11,17 @@ interface Session {
   app: string; title: string; start: number; end: number; url?: string
   state?: 'active' | 'idle' | 'locked' | 'sleep'
   pid?: number; processPath?: string; description?: string
+  keyCount?: number; clickCount?: number; mouseDistance?: number
 }
 
 interface SystemEvent {
-  type: 'startup' | 'shutdown' | 'suspend' | 'resume' | 'lock' | 'unlock'
+  type: 'startup' | 'shutdown' | 'suspend' | 'resume' | 'lock' | 'unlock' | 'music-play' | 'music-end'
   time: number
+  label?: string
+  detail?: string
 }
+interface DailyNote { text: string; mood: string; tags: string[] }
+interface SystemMetric { time: number; cpu: number; memory: number; uptime: number; online: boolean; onBattery: boolean }
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -410,6 +415,8 @@ function SummaryCards({ sessions }: { sessions: Session[] }) {
   const switches = Array(24).fill(0) as number[]
   active.slice(1).forEach(s => { switches[new Date(s.start).getHours()]++ })
   const peakHour = Math.max(...switches) > 0 ? switches.indexOf(Math.max(...switches)) : -1
+  const keyCount = active.reduce((sum, s) => sum + (s.keyCount ?? 0), 0)
+  const clickCount = active.reduce((sum, s) => sum + (s.clickCount ?? 0), 0)
   const values = [
     { label: '有效使用', value: fmtDuration(activeMs), icon: Timer, color: '#14b8a6' },
     { label: '空闲时间', value: fmtDuration(idleMs), icon: Moon, color: '#64748b' },
@@ -417,9 +424,11 @@ function SummaryCards({ sessions }: { sessions: Session[] }) {
     { label: '最长专注', value: fmtDuration(longest), icon: Activity, color: '#a855f7' },
     { label: '首末活动', value: first ? `${fmtTime(first)}–${fmtTime(last)}` : '—', icon: Timer, color: '#f59e0b' },
     { label: '切换高峰', value: peakHour >= 0 ? `${String(peakHour).padStart(2, '0')}:00 · ${switches[peakHour]}次` : '—', icon: BarChart3, color: '#ef4444' },
+    { label: '键盘输入', value: `${keyCount.toLocaleString()} 次`, icon: Terminal, color: '#22c55e' },
+    { label: '鼠标点击', value: `${clickCount.toLocaleString()} 次`, icon: Activity, color: '#06b6d4' },
   ]
   return (
-    <div className="grid grid-cols-3 gap-2 px-4 pt-3">
+    <div className="grid grid-cols-4 gap-2 px-4 pt-3">
       {values.map(({ label, value, icon: Icon, color }) => (
         <div key={label} className="rounded-lg bg-white/[0.035] px-3 py-2.5">
           <div className="mb-1 flex items-center gap-1.5 text-[10px] text-secondary"><Icon size={11} style={{ color }} />{label}</div>
@@ -490,6 +499,7 @@ function CategoryStats({ sessions }: { sessions: Session[] }) {
 
 const EVENT_LABELS: Record<SystemEvent['type'], string> = {
   startup: '软件启动', shutdown: '软件退出', suspend: '电脑休眠', resume: '电脑唤醒', lock: '屏幕锁定', unlock: '屏幕解锁',
+  'music-play': '开始播放', 'music-end': '播放结束',
 }
 
 function SystemEvents({ events }: { events: SystemEvent[] }) {
@@ -500,13 +510,43 @@ function SystemEvents({ events }: { events: SystemEvent[] }) {
       <div className="flex flex-wrap gap-2">
         {events.map((event, index) => (
           <span key={`${event.time}-${index}`} className="flex items-center gap-1 rounded bg-white/[0.04] px-2 py-1 text-[10px] text-secondary">
-            {event.type === 'lock' || event.type === 'unlock' ? <LockKeyhole size={10} /> : event.type === 'suspend' || event.type === 'resume' ? <Moon size={10} /> : <Power size={10} />}
-            {fmtTime(event.time)} {EVENT_LABELS[event.type]}
+            {event.type === 'music-play' || event.type === 'music-end' ? <Music2 size={10} /> : event.type === 'lock' || event.type === 'unlock' ? <LockKeyhole size={10} /> : event.type === 'suspend' || event.type === 'resume' ? <Moon size={10} /> : <Power size={10} />}
+            {fmtTime(event.time)} {EVENT_LABELS[event.type]} {event.label ? `· ${event.label}` : ''}
           </span>
         ))}
       </div>
     </div>
   )
+}
+
+function SystemHealth({ metrics }: { metrics: SystemMetric[] }) {
+  if (!metrics.length) return null
+  const latest = metrics[metrics.length - 1]
+  const avgCpu = Math.round(metrics.reduce((sum, m) => sum + m.cpu, 0) / metrics.length)
+  const avgMemory = Math.round(metrics.reduce((sum, m) => sum + m.memory, 0) / metrics.length)
+  return (
+    <div className="px-4 pb-3">
+      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-secondary">系统状态</p>
+      <div className="grid grid-cols-4 gap-2 text-[10px]">
+        <div className="rounded bg-white/[0.035] p-2 text-secondary">平均 CPU<p className="mt-1 text-[13px] font-semibold text-secondaryDark">{avgCpu}%</p></div>
+        <div className="rounded bg-white/[0.035] p-2 text-secondary">平均内存<p className="mt-1 text-[13px] font-semibold text-secondaryDark">{avgMemory}%</p></div>
+        <div className="rounded bg-white/[0.035] p-2 text-secondary">网络<p className="mt-1 text-[13px] font-semibold text-secondaryDark">{latest.online ? '在线' : '离线'}</p></div>
+        <div className="rounded bg-white/[0.035] p-2 text-secondary">电源<p className="mt-1 text-[13px] font-semibold text-secondaryDark">{latest.onBattery ? '电池' : '交流电'}</p></div>
+      </div>
+    </div>
+  )
+}
+
+function WeeklyTrend({ data }: { data: Record<string, number> }) {
+  const day = new Date(); day.setHours(0, 0, 0, 0)
+  const total = (from: number, to: number) => {
+    let sum = 0
+    for (let offset = from; offset <= to; offset++) { const d = new Date(day); d.setDate(d.getDate() - offset); sum += data[toDateStr(d)] ?? 0 }
+    return sum
+  }
+  const current = total(0, 6), previous = total(7, 13)
+  const change = previous ? Math.round((current - previous) / previous * 100) : 0
+  return <span className={`text-[10px] ${change > 0 ? 'text-accent' : change < 0 ? 'text-orange-400' : 'text-secondary'}`}>本周 {fmtDuration(current)} · 较上周 {change > 0 ? '+' : ''}{change}%</span>
 }
 
 function SessionRow({ s }: { s: Session }) {
@@ -546,12 +586,16 @@ export default function ActivityLog() {
   const [heatmapData, setHeatmapData] = useState<Record<string, number>>({})
   const [query,       setQuery]       = useState('')
   const [filter,      setFilter]      = useState<'all' | 'active' | 'inactive'>('all')
+  const [note,        setNote]        = useState<DailyNote>({ text: '', mood: '', tags: [] })
+  const [metrics,     setMetrics]     = useState<SystemMetric[]>([])
   const toast = useToastStore()
 
   const loadSessions = useCallback(async () => {
-    const data = await window.electron.invoke<{ sessions: Session[]; events: SystemEvent[] }>('activity:getDayDetails', toDateStr(date))
+    const data = await window.electron.invoke<{ sessions: Session[]; events: SystemEvent[]; note: DailyNote; metrics: SystemMetric[] }>('activity:getDayDetails', toDateStr(date))
     setSessions(data?.sessions ?? [])
     setEvents(data?.events ?? [])
+    setNote(data?.note ?? { text: '', mood: '', tags: [] })
+    setMetrics(data?.metrics ?? [])
   }, [date])
 
   const loadHeatmap = useCallback(async () => {
@@ -599,6 +643,11 @@ export default function ActivityLog() {
     if (ok) toast.show(`${format.toUpperCase()} 已导出`, 'success')
   }
 
+  function saveNote(next: DailyNote) {
+    setNote(next)
+    window.electron.invoke('activity:saveNote', { date: toDateStr(date), note: next })
+  }
+
   const activeSessions = sessions.filter(isActiveSession)
   const totalMs = activeSessions.reduce((a, s) => a + (s.end - s.start), 0)
   const normalizedQuery = query.trim().toLowerCase()
@@ -617,6 +666,7 @@ export default function ActivityLog() {
 
       {/* Heatmap */}
       <ActivityHeatmap data={heatmapData} selectedDate={toDateStr(date)} onSelect={selectDay} />
+      <div className="flex justify-end px-4 pb-2"><WeeklyTrend data={heatmapData} /></div>
 
       {/* Day strip */}
       <div className="flex flex-shrink-0 items-center justify-between border-t border-b border-dividerLight bg-primary/60 px-4 py-2">
@@ -684,6 +734,18 @@ export default function ActivityLog() {
         ) : (
           <>
             <SummaryCards sessions={sessions} />
+            <div className="mx-4 mt-3 rounded-lg bg-white/[0.025] p-3">
+              <div className="mb-2 flex items-center gap-2">
+                <span className="text-[11px] font-semibold text-secondary">今日手记</span>
+                <div className="flex gap-1">
+                  {['😫', '😕', '😐', '🙂', '🤩'].map(mood => <button key={mood} onClick={() => saveNote({ ...note, mood })} className={`rounded px-1.5 py-0.5 text-[13px] ${note.mood === mood ? 'bg-accent/20' : 'opacity-50 hover:opacity-100'}`}>{mood}</button>)}
+                </div>
+                <input value={note.tags.join(', ')} onChange={e => setNote({ ...note, tags: e.target.value.split(',').map(v => v.trim()).filter(Boolean) })}
+                  onBlur={() => saveNote(note)} placeholder="标签，用逗号分隔" className="ml-auto w-48 bg-transparent text-right text-[10px] text-secondary outline-none" />
+              </div>
+              <textarea value={note.text} onChange={e => setNote({ ...note, text: e.target.value })} onBlur={() => saveNote(note)}
+                placeholder="今天完成了什么、状态如何、明天要做什么……" className="h-16 w-full resize-none rounded bg-black/10 p-2 text-[11px] leading-relaxed text-secondaryDark outline-none placeholder:text-secondary" />
+            </div>
             <DayTimeline sessions={sessions} date={date} />
 
             <HourlyChart sessions={sessions} date={date} />
@@ -692,6 +754,7 @@ export default function ActivityLog() {
             <div className="pt-3"><CategoryStats sessions={sessions} /></div>
 
             <SystemEvents events={events} />
+            <SystemHealth metrics={metrics} />
 
             <div className="mx-4 border-t border-dividerLight" />
             <div className="pt-3">
