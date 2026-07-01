@@ -116,13 +116,13 @@ function VideoCard({ filePath, active, onPlay, onRemove }: {
   )
 }
 
-function WorkshopCard({ item, active, onApply }: {
-  item: WorkshopItem; active: boolean; onApply: () => void
+function WorkshopCard({ item, active, busy, onApply }: {
+  item: WorkshopItem; active: boolean; busy: boolean; onApply: () => void
 }) {
   const typeLabel = item.type === 'web' ? '网页' : '视频'
   return (
-    <button onClick={onApply}
-      className={['group overflow-hidden rounded-xl text-left transition-all',
+    <button onClick={onApply} disabled={busy}
+      className={['group overflow-hidden rounded-xl text-left transition-all disabled:cursor-wait disabled:opacity-70',
         active ? 'ring-2 ring-accent/60' : 'hover:bg-white/[0.025]'].join(' ')}>
       <div className="relative h-28 overflow-hidden bg-primaryDark">
         {item.preview ? (
@@ -134,12 +134,13 @@ function WorkshopCard({ item, active, onApply }: {
         <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-transparent to-transparent" />
         <span className="absolute left-2 top-2 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white backdrop-blur-sm">{typeLabel}</span>
         {active && <span className="absolute right-2 top-2 rounded-full bg-accent px-2 py-0.5 text-[10px] text-white">运行中</span>}
+        {busy && <div className="absolute inset-0 flex items-center justify-center gap-2 bg-black/65 text-[11px] text-white"><Loader2 size={14} className="animate-spin" />首次兼容处理中…</div>}
         <span className="absolute bottom-2 left-2 right-2 line-clamp-2 text-[12px] font-medium text-white">{item.title}</span>
       </div>
       <div className="flex items-center justify-between gap-2 px-2.5 py-2">
         <span className="truncate text-[10px] text-secondary">Workshop #{item.id}</span>
         <span className="flex-shrink-0 text-[11px] text-accent">
-          {active ? '重新应用' : '应用'}
+          {busy ? '处理中' : active ? '重新应用' : '应用'}
         </span>
       </div>
     </button>
@@ -181,6 +182,7 @@ export default function Wallpaper() {
   const [recentVids,  setRecentVids] = useState<string[]>([])
   const [workshop, setWorkshop] = useState<WorkshopScanResult>({ directory: '', items: [] })
   const [workshopStatus, setWorkshopStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
+  const [convertingId, setConvertingId] = useState<string | null>(null)
 
   // 本地壁纸状态
   const [localFolder,    setLocalFolder]    = useState('')
@@ -287,13 +289,17 @@ export default function Wallpaper() {
   }
 
   async function setWorkshopSource(item: WorkshopItem) {
+    if (convertingId) return
+    setConvertingId(item.id)
     try {
       const source = { type: item.type, id: `workshop:${item.id}`, path: item.file }
-      await window.electron.invoke('wallpaper:setSource', source)
-      setConfig(c => ({ ...c, enabled: true, source }))
+      const prepared = await window.electron.invoke<EngineConfig['source']>('wallpaper:setSource', source)
+      setConfig(c => ({ ...c, enabled: true, source: prepared ?? source }))
       toast.show(`已应用「${item.title}」`, 'success')
     } catch (error) {
       toast.show(error instanceof Error ? error.message : '应用创意工坊壁纸失败', 'error')
+    } finally {
+      setConvertingId(null)
     }
   }
 
@@ -435,6 +441,7 @@ export default function Wallpaper() {
                   {workshop.items.map(item => (
                     <WorkshopCard key={item.id} item={item}
                       active={config.enabled && config.source?.id === `workshop:${item.id}`}
+                      busy={convertingId === item.id}
                       onApply={() => setWorkshopSource(item)} />
                   ))}
                 </div>

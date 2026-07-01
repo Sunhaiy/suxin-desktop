@@ -8,8 +8,10 @@
  *   - Built-in HTML/Canvas animations (seeded to getDataBase()/wallpaper-themes/)
  *   - Local video files (mp4, webm, mkv, mov) — wrapped in a generated HTML page
  */
-import { BrowserWindow, ipcMain, screen, dialog, shell } from 'electron'
-import { execFile } from 'child_process'
+import { app, BrowserWindow, ipcMain, screen, dialog, shell } from 'electron'
+import { execFile, spawn } from 'child_process'
+import { createHash } from 'crypto'
+import ffmpegStatic from 'ffmpeg-static'
 import * as https from 'https'
 import fs from 'fs'
 import path from 'path'
@@ -808,6 +810,109 @@ function buildVideoPage(filePath: string, volume: number): string {
 </body></html>`
 }
 
+function getFfmpegPath(): string {
+  const bundled = String(ffmpegStatic ?? '')
+  const unpacked = bundled.replace('app.asar', 'app.asar.unpacked')
+  if (unpacked && fs.existsSync(unpacked)) return unpacked
+  if (bundled && fs.existsSync(bundled)) return bundled
+  throw new Error('缺少视频兼容组件 FFmpeg')
+}
+
+function videoNeedsConversion(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase()
+  if (ext === '.webm') return false
+  if (!['.mp4', '.m4v', '.mov'].includes(ext)) return true
+  try {
+    const stat = fs.statSync(filePath)
+    const size = Math.min(stat.size, 2 * 1024 * 1024)
+    const fd = fs.openSync(filePath, 'r')
+    const head = Buffer.alloc(size)
+    const tail = Buffer.alloc(size)
+    fs.readSync(fd, head, 0, size, 0)
+    fs.readSync(fd, tail, 0, size, Math.max(0, stat.size - size))
+    fs.closeSync(fd)
+    const markers = Buffer.concat([head, tail]).toString('latin1')
+    return /mp4v|hvc1|hev1|av01/.test(markers)
+  } catch { return false }
+}
+
+const conversionJobs = new Map<string, Promise<string>>()
+let conversionTail: Promise<unknown> = Promise.resolve()
+const backgroundConversionQueue: string[] = []
+const queuedConversions = new Set<string>()
+let backgroundConversionRunning = false
+
+async function convertVideoForChromium(filePath: string): Promise<string> {
+  if (!videoNeedsConversion(filePath)) return filePath
+  const stat = fs.statSync(filePath)
+  const key = createHash('sha1').update(`${filePath}|${stat.size}|${stat.mtimeMs}`).digest('hex')
+  let cacheDir = path.join(getDataBase(), 'wallpaper-video-cache')
+  try { fs.mkdirSync(cacheDir, { recursive: true }) }
+  catch {
+    cacheDir = path.join(app.getPath('userData'), 'wallpaper-video-cache')
+    fs.mkdirSync(cacheDir, { recursive: true })
+  }
+  const output = path.join(cacheDir, `${key}.mp4`)
+  if (fs.existsSync(output) && fs.statSync(output).size > 1024) return output
+  const temp = `${output}.tmp.mp4`
+  try { if (fs.existsSync(temp)) fs.unlinkSync(temp) } catch {}
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(getFfmpegPath(), [
+      '-y', '-hide_banner', '-loglevel', 'error', '-fflags', '+genpts', '-i', filePath,
+      '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '192k',
+      '-movflags', '+faststart', temp,
+    ], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
+    let error = ''
+    child.stderr?.on('data', chunk => { error += chunk.toString().slice(-4000) })
+    child.on('error', reject)
+    child.on('exit', code => code === 0 ? resolve() : reject(new Error(error || `FFmpeg exited with ${code}`)))
+  })
+  fs.renameSync(temp, output)
+  return output
+}
+
+function ensureChromiumPlayable(filePath: string): Promise<string> {
+  const active = conversionJobs.get(filePath)
+  if (active) return active
+  const job = conversionTail
+    .catch(() => {})
+    .then(() => convertVideoForChromium(filePath))
+    .finally(() => conversionJobs.delete(filePath))
+  conversionTail = job
+  conversionJobs.set(filePath, job)
+  return job
+}
+
+async function runBackgroundConversions(): Promise<void> {
+  if (backgroundConversionRunning) return
+  backgroundConversionRunning = true
+  try {
+    while (backgroundConversionQueue.length) {
+      const file = backgroundConversionQueue.shift()!
+      queuedConversions.delete(file)
+      try {
+        console.log('[wallpaperEngine] background converting:', file)
+        await ensureChromiumPlayable(file)
+        console.log('[wallpaperEngine] background conversion done:', file)
+      } catch (error) {
+        console.error('[wallpaperEngine] background conversion failed:', file, error)
+      }
+    }
+  } finally {
+    backgroundConversionRunning = false
+  }
+}
+
+function queueBackgroundConversions(files: string[]): void {
+  for (const file of files) {
+    if (!videoNeedsConversion(file) || queuedConversions.has(file) || conversionJobs.has(file)) continue
+    queuedConversions.add(file)
+    backgroundConversionQueue.push(file)
+  }
+  void runBackgroundConversions()
+}
+
 async function createWindow(): Promise<BrowserWindow> {
   const { bounds } = screen.getPrimaryDisplay()
   const w = new BrowserWindow({
@@ -1059,9 +1164,12 @@ export async function scanWorkshopItems(): Promise<WorkshopScanResult> {
     } catch {}
   }
 
+  const sortedItems = items.sort((a, b) => a.title.localeCompare(b.title, 'zh'))
+  queueBackgroundConversions(sortedItems.filter(item => item.type === 'video').map(item => item.file))
+
   return {
     directory: workshopDir,
-    items: items.sort((a, b) => a.title.localeCompare(b.title, 'zh')),
+    items: sortedItems,
   }
 }
 
@@ -1077,9 +1185,14 @@ export function setupWallpaperEngineIPC(): void {
   ipcMain.handle('wallpaper:getConfig',  () => loadConfig())
 
   ipcMain.handle('wallpaper:setSource', async (_e, source: EngineConfig['source']) => {
-    const c = { ...loadConfig(), source, enabled: true }
+    if (!source) return null
+    const prepared = source.type === 'video' && source.path
+      ? { ...source, path: await ensureChromiumPlayable(source.path) }
+      : source
+    const c = { ...loadConfig(), source: prepared, enabled: true }
     saveConfig(c)
     await startEngine(c)
+    return prepared
   })
 
   ipcMain.handle('wallpaper:setEnabled', async (_e, enabled: boolean) => {
