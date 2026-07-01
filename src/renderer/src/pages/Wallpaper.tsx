@@ -39,12 +39,12 @@ interface WorkshopScanResult {
 
 // ── ThemeCard ─────────────────────────────────────────────────────────────────
 
-function ThemeCard({ theme, active, onClick }: { theme: Theme; active: boolean; onClick: () => void }) {
+function ThemeCard({ theme, active, onClick, onDelete }: { theme: Theme; active: boolean; onClick: () => void; onDelete: () => void }) {
   const gradient = `linear-gradient(135deg, ${theme.colors.join(', ')})`
   return (
-    <button onClick={onClick}
-      className={['group relative overflow-hidden rounded-xl border text-left transition-all duration-200',
-        active ? 'border-accent ring-1 ring-accent/40' : 'border-white/8 hover:border-white/20'].join(' ')}>
+    <button onClick={onClick} onContextMenu={e => { e.preventDefault(); onDelete() }}
+      className={['group relative overflow-hidden rounded-xl text-left transition-all duration-200',
+        active ? 'ring-2 ring-accent/60' : 'hover:bg-white/[0.025]'].join(' ')}>
       <div className="relative h-24 w-full" style={{ background: gradient }}>
         <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-[1.5s]" />
         {active && (
@@ -66,12 +66,12 @@ function ThemeCard({ theme, active, onClick }: { theme: Theme; active: boolean; 
 
 // ── LocalImageCard ────────────────────────────────────────────────────────────
 
-function LocalImageCard({ image, setting, onSet }: {
-  image: LocalImage; setting: boolean; onSet: () => void
+function LocalImageCard({ image, setting, onSet, onDelete }: {
+  image: LocalImage; setting: boolean; onSet: () => void; onDelete: () => void
 }) {
   return (
-    <button onClick={onSet} disabled={setting}
-      className="group relative overflow-hidden rounded-xl border border-white/8 hover:border-white/20 text-left transition-all duration-200 disabled:opacity-60">
+    <button onClick={onSet} onContextMenu={e => { e.preventDefault(); onDelete() }} disabled={setting}
+      className="group relative overflow-hidden rounded-xl text-left transition-all duration-200 hover:bg-white/[0.025] disabled:opacity-60">
       <div className="relative h-28 w-full overflow-hidden bg-primaryDark">
         <img src={image.url} alt={image.name} loading="lazy"
           className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105" />
@@ -94,14 +94,14 @@ function LocalImageCard({ image, setting, onSet }: {
 
 // ── VideoCard ─────────────────────────────────────────────────────────────────
 
-function VideoCard({ filePath, active, onPlay, onRemove }: {
-  filePath: string; active: boolean; onPlay: () => void; onRemove: () => void
+function VideoCard({ filePath, active, onPlay, onRemove, onDelete }: {
+  filePath: string; active: boolean; onPlay: () => void; onRemove: () => void; onDelete: () => void
 }) {
   const name = filePath.split(/[\\/]/).pop() ?? filePath
   const ext  = name.split('.').pop()?.toUpperCase() ?? ''
   return (
-    <div className={['flex items-center gap-3 rounded-xl border px-3 py-2.5 transition-all',
-      active ? 'border-accent/50 bg-accent/5' : 'border-white/8 hover:border-white/15'].join(' ')}>
+    <div onContextMenu={e => { e.preventDefault(); onDelete() }} className={['flex items-center gap-3 rounded-xl px-3 py-2.5 transition-all',
+      active ? 'bg-accent/5 ring-2 ring-accent/60' : 'hover:bg-white/[0.025]'].join(' ')}>
       <div className="flex h-10 w-14 flex-shrink-0 items-center justify-center rounded-lg bg-white/5 text-[10px] font-bold text-secondary">{ext}</div>
       <div className="min-w-0 flex-1">
         <p className="truncate text-[12px] font-medium text-secondaryDark">{name}</p>
@@ -116,12 +116,12 @@ function VideoCard({ filePath, active, onPlay, onRemove }: {
   )
 }
 
-function WorkshopCard({ item, active, busy, onApply }: {
-  item: WorkshopItem; active: boolean; busy: boolean; onApply: () => void
+function WorkshopCard({ item, active, busy, onApply, onDelete }: {
+  item: WorkshopItem; active: boolean; busy: boolean; onApply: () => void; onDelete: () => void
 }) {
   const typeLabel = item.type === 'web' ? '网页' : '视频'
   return (
-    <button onClick={onApply} disabled={busy}
+    <button onClick={onApply} onContextMenu={e => { e.preventDefault(); onDelete() }} disabled={busy}
       className={['group overflow-hidden rounded-xl text-left transition-all disabled:cursor-wait disabled:opacity-70',
         active ? 'ring-2 ring-accent/60' : 'hover:bg-white/[0.025]'].join(' ')}>
       <div className="relative h-28 overflow-hidden bg-primaryDark">
@@ -258,6 +258,22 @@ export default function Wallpaper() {
     }
   }
 
+  async function deleteWallpaper(kind: 'workshop' | 'image' | 'video', filePath: string, label: string, id?: string) {
+    try {
+      const deleted = await window.electron.invoke<boolean>('wallpaper:deletePath', { kind, path: filePath, label, id })
+      if (!deleted) return
+      if (config.source?.id === id || config.source?.id === filePath || config.source?.path === filePath) {
+        setConfig(c => ({ ...c, enabled: false, source: undefined }))
+      }
+      if (kind === 'workshop') await scanWorkshop()
+      else if (kind === 'image') await doLoadImages(localFolder)
+      else removeRecentVid(filePath)
+      toast.show(`已将「${label}」移入回收站`, 'success')
+    } catch (error) {
+      toast.show(error instanceof Error ? error.message : '删除失败', 'error')
+    }
+  }
+
   // ── 视频壁纸 ──────────────────────────────────────────────────────
 
   function addRecentVid(p: string) {
@@ -388,7 +404,8 @@ export default function Wallpaper() {
             {themes.map(theme => (
               <ThemeCard key={theme.id} theme={theme}
                 active={activeThemeId === theme.id}
-                onClick={() => setThemeSource(theme.id)} />
+                onClick={() => setThemeSource(theme.id)}
+                onDelete={() => toast.show('内置主题属于应用资源，不能删除', 'info')} />
             ))}
           </div>
         )}
@@ -442,7 +459,8 @@ export default function Wallpaper() {
                     <WorkshopCard key={item.id} item={item}
                       active={config.enabled && config.source?.id === `workshop:${item.id}`}
                       busy={convertingId === item.id}
-                      onApply={() => setWorkshopSource(item)} />
+                      onApply={() => setWorkshopSource(item)}
+                      onDelete={() => deleteWallpaper('workshop', item.file, item.title, `workshop:${item.id}`)} />
                   ))}
                 </div>
               </>
@@ -506,7 +524,8 @@ export default function Wallpaper() {
                 {localImages.map(img => (
                   <LocalImageCard key={img.path} image={img}
                     setting={localSettingId === img.path}
-                    onSet={() => setLocalWallpaper(img)} />
+                    onSet={() => setLocalWallpaper(img)}
+                    onDelete={() => deleteWallpaper('image', img.path, img.name)} />
                 ))}
               </div>
             )}
@@ -536,7 +555,8 @@ export default function Wallpaper() {
                 <p className="text-[11px] font-semibold uppercase tracking-wide text-secondary">最近使用</p>
                 {recentVids.map(p => (
                   <VideoCard key={p} filePath={p} active={activeVideo === p}
-                    onPlay={() => setVideoSource(p)} onRemove={() => removeRecentVid(p)} />
+                    onPlay={() => setVideoSource(p)} onRemove={() => removeRecentVid(p)}
+                    onDelete={() => deleteWallpaper('video', p, p.split(/[\\/]/).pop() ?? p)} />
                 ))}
               </div>
             )}

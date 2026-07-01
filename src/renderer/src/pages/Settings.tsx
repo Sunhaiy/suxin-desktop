@@ -38,21 +38,24 @@ export default function Settings() {
   const [navPortBusy,   setNavPortBusy]   = useState(false)
   const [copied,        setCopied]        = useState(false)
   const [activityDir,   setActivityDir]   = useState('')
+  const [navDir,        setNavDir]        = useState('')
   const toast = useToastStore()
 
   async function refresh() {
-    const [al, ver, port, url, trackingDir] = await Promise.all([
+    const [al, ver, port, url, trackingDir, siteDir] = await Promise.all([
       window.electron?.app.getAutoLaunch(),
       window.electron?.app.version(),
       window.electron.invoke<number>('nav:getPort'),
       window.electron.invoke<string>('nav:getUrl'),
       window.electron.invoke<string>('activity:getDataDir'),
+      window.electron.invoke<string>('nav:getDir'),
     ])
     setAutoLaunch(al ?? false)
     setVersion(ver ?? '')
     if (port)  { setNavPort(port);  setNavPortInput(String(port)) }
     if (url)   setNavUrl(url)
     if (trackingDir) setActivityDir(trackingDir)
+    if (siteDir) setNavDir(siteDir)
   }
 
   useEffect(() => { refresh() }, [])
@@ -114,7 +117,7 @@ export default function Settings() {
         <section className="px-4 pt-4">
           <p className="mb-1 text-tiny font-semibold uppercase tracking-wider text-secondaryLight">导航页</p>
           <p className="mb-3 text-tiny text-secondary opacity-60">
-            本地 HTTP 服务，可将浏览器主页设置为此地址。修改 userData/nav/index.html 自定义内容。
+            本地 HTTP 服务，可将浏览器主页设置为此地址，并选择任意文件夹作为站点根目录。
           </p>
 
           <SettingRow label="端口">
@@ -153,13 +156,17 @@ export default function Settings() {
             </div>
           </SettingRow>
 
-          <SettingRow label="文件目录" description="打开存放页面文件的文件夹">
-            <button
-              onClick={() => window.electron.invoke('nav:openDir')}
-              className="flex items-center gap-1.5 rounded px-2.5 py-1 text-tiny text-secondary transition-colors hover:bg-primaryDark hover:text-secondaryDark"
-            >
-              <FolderOpen size={12} /> 打开
-            </button>
+          <SettingRow label="站点目录" description={navDir || '选择包含 index.html 的文件夹'}>
+            <div className="flex items-center gap-1">
+              <button onClick={async () => {
+                const folder = await window.electron.invoke<string | null>('nav:pickDir')
+                if (folder) { setNavDir(folder); toast.show('站点目录已切换', 'success') }
+              }} className="flex items-center gap-1.5 rounded px-2.5 py-1 text-tiny text-accent transition-colors hover:bg-primaryDark">
+                <FolderOpen size={12} /> 选择
+              </button>
+              <button onClick={() => window.electron.invoke('nav:openDir')}
+                className="rounded px-2.5 py-1 text-tiny text-secondary transition-colors hover:bg-primaryDark hover:text-secondaryDark">打开</button>
+            </div>
           </SettingRow>
         </section>
 

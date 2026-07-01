@@ -4,7 +4,7 @@
  * Port is persisted in userData/nav-config.json and changeable at runtime.
  * Creates an example index.html on first run.
  */
-import { app, ipcMain, shell } from 'electron'
+import { app, dialog, ipcMain, shell } from 'electron'
 import http from 'http'
 import fs from 'fs'
 import path from 'path'
@@ -12,6 +12,7 @@ import { getDataBase } from './paths'
 
 const DEFAULT_PORT = 9900
 let currentPort    = DEFAULT_PORT
+let currentNavDir  = ''
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -293,26 +294,27 @@ function getConfigPath(): string {
   return path.join(getDataBase(), 'nav-config.json')
 }
 
-function loadPort(): number {
+function loadConfig(): { port: number; folder?: string } {
   try {
     const cfg = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8'))
     const p   = parseInt(cfg.port, 10)
-    return p >= 1024 && p <= 65535 ? p : DEFAULT_PORT
-  } catch { return DEFAULT_PORT }
+    return { port: p >= 1024 && p <= 65535 ? p : DEFAULT_PORT, folder: cfg.folder }
+  } catch { return { port: DEFAULT_PORT } }
 }
 
-function savePort(port: number): void {
+function saveConfig(change: { port?: number; folder?: string }): void {
   try {
     let cfg: Record<string, unknown> = {}
     try { cfg = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8')) } catch {}
-    fs.writeFileSync(getConfigPath(), JSON.stringify({ ...cfg, port }))
+    fs.writeFileSync(getConfigPath(), JSON.stringify({ ...cfg, ...change }))
   } catch {}
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
 
 function getNavDir(): string {
-  const d = path.join(getDataBase(), 'nav')
+  const configured = currentNavDir || loadConfig().folder
+  const d = configured && fs.existsSync(configured) ? path.resolve(configured) : path.join(getDataBase(), 'nav')
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true })
   return d
 }
@@ -358,7 +360,9 @@ function doListen(port: number): void {
 }
 
 export function startNavServer(): void {
-  currentPort = loadPort()
+  const config = loadConfig()
+  currentPort = config.port
+  currentNavDir = config.folder && fs.existsSync(config.folder) ? path.resolve(config.folder) : ''
   doListen(currentPort)
 }
 
@@ -382,15 +386,33 @@ function changePort(newPort: number): Promise<string> {
   })
 }
 
+function changeDirectory(folder: string): Promise<string> {
+  currentNavDir = path.resolve(folder)
+  saveConfig({ folder: currentNavDir })
+  return new Promise(resolve => {
+    const restart = () => { doListen(currentPort); resolve(currentNavDir) }
+    if (server) server.close(() => { server = null; restart() })
+    else restart()
+  })
+}
+
 // ── IPC ─────────────────────────────────────────────────────────────────────
 
 export function setupNavIPC(): void {
   ipcMain.handle('nav:getUrl',  () => getNavUrl())
   ipcMain.handle('nav:getPort', () => currentPort)
+  ipcMain.handle('nav:getDir', () => getNavDir())
   ipcMain.handle('nav:setPort', async (_e, port: number) => {
     if (port < 1024 || port > 65535) throw new Error('port out of range')
-    savePort(port)
+    saveConfig({ port })
     return changePort(port)
   })
   ipcMain.handle('nav:openDir', () => shell.openPath(getNavDir()))
+  ipcMain.handle('nav:pickDir', async () => {
+    const result = await dialog.showOpenDialog({
+      title: '选择本地站点目录', defaultPath: getNavDir(), properties: ['openDirectory', 'createDirectory'],
+    })
+    if (result.canceled || !result.filePaths[0]) return null
+    return changeDirectory(result.filePaths[0])
+  })
 }

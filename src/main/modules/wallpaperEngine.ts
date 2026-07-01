@@ -852,7 +852,10 @@ async function convertVideoForChromium(filePath: string): Promise<string> {
     cacheDir = path.join(app.getPath('userData'), 'wallpaper-video-cache')
     fs.mkdirSync(cacheDir, { recursive: true })
   }
-  const output = path.join(cacheDir, `${key}.mp4`)
+  // Version the cache by quality profile so older CRF 20 conversions are never reused.
+  const output = path.join(cacheDir, `${key}-hq2.mp4`)
+  const legacyOutput = path.join(cacheDir, `${key}.mp4`)
+  try { if (fs.existsSync(legacyOutput)) fs.unlinkSync(legacyOutput) } catch {}
   if (fs.existsSync(output) && fs.statSync(output).size > 1024) return output
   const temp = `${output}.tmp.mp4`
   try { if (fs.existsSync(temp)) fs.unlinkSync(temp) } catch {}
@@ -860,7 +863,7 @@ async function convertVideoForChromium(filePath: string): Promise<string> {
     const child = spawn(getFfmpegPath(), [
       '-y', '-hide_banner', '-loglevel', 'error', '-fflags', '+genpts', '-i', filePath,
       '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-      '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '192k',
+      '-preset', 'slow', '-crf', '12', '-c:a', 'aac', '-b:a', '256k',
       '-movflags', '+faststart', temp,
     ], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
     let error = ''
@@ -1227,6 +1230,54 @@ export function setupWallpaperEngineIPC(): void {
       properties: ['openFile'],
     })
     return result.canceled ? null : result.filePaths[0]
+  })
+
+  ipcMain.handle('wallpaper:deletePath', async (_e, payload: {
+    kind: 'workshop' | 'image' | 'video'; path: string; id?: string; label?: string
+  }) => {
+    if (!payload?.path) return false
+    const sourcePath = path.resolve(payload.path)
+    let target = sourcePath
+    if (payload.kind === 'workshop') {
+      target = path.dirname(sourcePath)
+      if (!fs.existsSync(path.join(target, 'project.json'))) throw new Error('不是有效的创意工坊项目')
+    } else if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+      return false
+    }
+    const answer = await dialog.showMessageBox({
+      type: 'warning', title: '删除壁纸',
+      message: `确定删除「${payload.label || path.basename(target)}」吗？`,
+      detail: '文件会移入回收站，可以从回收站恢复。',
+      buttons: ['取消', '移入回收站'], defaultId: 0, cancelId: 0,
+    })
+    if (answer.response !== 1) return false
+
+    if (payload.kind === 'workshop') {
+      queuedConversions.delete(sourcePath)
+      for (let i = backgroundConversionQueue.length - 1; i >= 0; i--) {
+        if (backgroundConversionQueue[i] === sourcePath) backgroundConversionQueue.splice(i, 1)
+      }
+      const converting = conversionJobs.get(sourcePath)
+      if (converting) await converting.catch(() => {})
+      try {
+        const stat = fs.statSync(sourcePath)
+        const key = createHash('sha1').update(`${sourcePath}|${stat.size}|${stat.mtimeMs}`).digest('hex')
+        for (const base of [getDataBase(), app.getPath('userData')]) {
+          for (const name of [`${key}.mp4`, `${key}-hq2.mp4`]) {
+            const cached = path.join(base, 'wallpaper-video-cache', name)
+            if (fs.existsSync(cached)) fs.unlinkSync(cached)
+          }
+        }
+      } catch {}
+    }
+
+    const cfg = loadConfig()
+    if (cfg.source && (cfg.source.id === payload.id || cfg.source.id === sourcePath || cfg.source.path === sourcePath)) {
+      stopEngine()
+      saveConfig({ ...cfg, enabled: false, source: undefined })
+    }
+    await shell.trashItem(target)
+    return true
   })
 
   ipcMain.handle('wallpaper:stop', () => stopEngine())
